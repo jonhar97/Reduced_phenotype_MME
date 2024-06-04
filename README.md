@@ -9,5 +9,4 @@ The Scots pine example data and pedigree are provided in the directory data. The
 # Code
 
 # References
-<a id="1">[1]</a>  
-Dutkowski, G. W., Costa E Silva, J., Gilmour, A. R., Wellendorf, H., & Aguiar, A. (2006). Spatial analysis enhances modelling of a wide variety of traits in forest genetic trials. Canadian Journal of Forest Research, 36(7), 1851–1870. 
+<a id="1">[1]</a> Dutkowski, G. W., Costa E Silva, J., Gilmour, A. R., Wellendorf, H., & Aguiar, A. (2006). Spatial analysis enhances modelling of a wide variety of traits in forest genetic trials. Canadian Journal of Forest Research, 36(7), 1851–1870. 
