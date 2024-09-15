@@ -1,0 +1,3144 @@
+---
+title: "F264Vindeln"
+author: "Jon Ahlinder"
+date: "2024-09-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd(".") # set your path
+require(dplyr)
+library(ggVennDiagram)
+require(vegan) # for procrustes analysis
+require(glmnet)
+require(MegaLMM)
+require(tidyverse)
+require(ggplot2)
+require(reshape2)
+library(asreml)
+require(asremlPlus)
+library(tidyr)
+require(randomForest)
+library(pcaMethods)
+library(cowplot)
+library(ggplot2)
+library(ggdendro)
+library(viridis)
+library("ape")
+library(dendextend)
+library(RColorBrewer)
+require(nadiv)
+require(AGHmatrix)
+library(bWGR)
+library(factoextra)
+``` 
+
+## Functions etc
+
+```{r}
+# function for renaming ids in pedigree
+rename_ped<-function(ped){
+  
+  nind <- nrow(ped)
+  newped <- ped
+  newnum <- 1
+  for(i in 1:nind){
+    tmpnr <- ped[i,1]
+    for(j in 1:3){
+      newped[which(ped[,j]==tmpnr),j] <- newnum # ind id
+    }
+    newnum <- newnum + 1
+  }
+  
+  return(newped)
+}
+# Bivariate analysis using ASReml
+bivar = function(trait1, trait2, data, ainv, start.val.add = NULL, start.val.res = NULL) {
+  
+  Dat <- data %>% 
+    select(c(Genotype_id,Family_id,all_of(trait1),all_of(trait2))) 
+  colnames(Dat)[3:4] <-c("Trait1","Trait2")
+  print(head(Dat))
+  if(is.null(start.val.add)){
+  # Bivariate run
+    res.as <- asreml(
+      fixed = cbind(Trait1,Trait2) ~ trait,
+      random = ~ us(trait):vm(Genotype_id, ainv), 
+      residual = ~ id(units):us(trait),
+      data = Dat,
+      na.action = na.method(x = "include", y = "include"),
+      ai.sing=TRUE,
+      maxit = 1000
+    )
+  }
+  else{
+    res.as <- asreml(
+      fixed = cbind(Trait1,Trait2) ~ trait,
+      random = ~ us(trait, init = start.val.add):vm(Genotype_id, ainv),
+      residual = ~ id(units):us(trait, init = start.val.res),
+      data = Dat,
+      na.action = na.method(x = "include", y = "include"),
+      ai.sing=TRUE,
+      maxit = 1000
+    )      
+  }
+
+  return(res.as)
+}
+# recode pedigree
+recode<- function(dat,ped){
+  # npar is the number of parents (P0)
+  # ngrp is the number of genetic groups
+  # save keys for ids in file recoded_ids.txt
+  # Open a connection to the file in append mode
+  fileConn <- file("recoded_ids.txt", open = "a")
+  nr <- nrow(dat)
+  dattmp <- dat # copy
+  ped1t <- ped
+  ngrp <- max(which(ped$Mum_id=="0"))
+  ntot <- min(which(ped$Mum_type=="I")) - 1
+  dum <- 1
+  for (i in (ngrp + 1):(ntot)){ # change parents id in pedigree: 1685 F1s and overlap
+    j <- ped$Genotype_id[i]
+    # ID
+    ped1t$Genotype_id[which(ped1t$Genotype_id == j)] <- dum
+    # Mum
+    ped1t$Mum_id[which(ped1t$Mum_id == j)] <- dum
+    # Dad
+    ped1t$Dad_id[which(ped1t$Dad_id == j)] <- dum
+    cat(sprintf("%s\t%d\n", j, dum), file = fileConn)
+    dum = dum + 1
+  }
+  for (i in 1:nr){ # F1 generation
+    j <- dat$Genotype_id[i]
+    # Id
+    dattmp$Genotype_id[which(dattmp$Genotype_id == j)] <- dum
+    ped1t$Genotype_id[which(ped1t$Genotype_id == j)] <- dum
+    # Mum
+    ped1t$Mum_id[which(ped1t$Mum_id == j)] <- dum
+    # Dad
+    ped1t$Dad_id[which(ped1t$Dad_id == j)] <- dum
+    cat(sprintf("%s\t%d\n", j, dum), file = fileConn)
+    dum <- dum + 1
+    
+  }
+  # Close the connection
+  close(fileConn)
+  
+  return(list(dattmp,ped1t,ped2t))
+  
+}
+```
+
+
+
+## Read adjusted phenotypic records
+Remember to change the path!
+```{r}
+######### adjusted phenotypic records
+dataF264_v2 <- 
+  read.table(file = "data/data_F264.txt",sep=",",header = T)
+######### pedigree
+pedigreeF264 <- read.table(file = "data/pedigree_F264.txt",sep=",",header=T)
+######### set save path
+spath <- ""
+```
+
+## Get summary statistics on each trait
+
+```{r}
+dataF264_v2 %>%
+  group_by(Family_id) %>%
+  summarise(mean = mean(Adj_Hjd_10,na.rm = TRUE),sd = sd(Adj_Hjd_10,na.rm = TRUE), n = n())
+summary <- dataF264_v2 %>% summarise (across (everything (), ~ sum (!is.na(.)))); summary 
+# plot figure as Supplementary fig. S1
+pt0 <- melt(summary) %>%
+  rename(Trait = variable, Observations = value) %>%
+  filter(!row_number() %in% c(1, 2)) %>%
+  mutate(Trait = sub("^Adj_", "", Trait))   %>%
+  ggplot(data=.,aes(x = Trait, y = Observations)) +
+  theme_minimal() +
+  geom_bar(stat="identity", width=0.5) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=0.5),
+        axis.text.y = element_text(size = 11,color = "black")); pt0
+ggsave(filename = paste0(spath,"/Figures/trait_records.png"), plot = pt0)
+ggsave(filename = paste0(spath,"/Figures/trait_records.pdf"), plot = pt0)
+
+ggsave(filename = "Supplementary_figure_S1.png", plot = pt0)
+ggsave(filename = "Supplementary_figure_S1.pdf", plot = pt0)
+# Remove trait with little overlap + binary traits with only living trees  
+dataF264_v3 <- dataF264_v2 %>%
+  select(-c(Adj_Kvar_47,Adj_Lev_10,Adj_Lev_14,Adj_Lev_26,Adj_Lev_47,Adj_Vit_10, Adj_Vit_14,Adj_Vit_26,Adj_Vit_47,Adj_Rak_14,Adj_Fstam_47,Adj_Sdbst_14))
+# Remove trait with few observations  
+dataF264_v3ny <- dataF264_v3 %>%
+  select(-c(Adj_Gdiagr130_14,Adj_Gvingr130_14, Adj_Gant_14,Adj_Dia_14, Adj_Sprant_14))
+
+```
+
+## Data wrangling
+Remove trees without records and normalize data (i.e. scale the values such that the variable has a mean of 0 and a standard deviation of 1)
+```{r}
+dataF264_v4 <- dataF264_v3 %>%
+  na.omit()
+cat(sprintf('Dimension of data matrix: %d x %d\n', dim(dataF264_v4)[1],dim(dataF264_v4)[2]))
+data.tmp <- dataF264_v3ny[,3:12]
+dataF264_v4ny <- dataF264_v3ny[rowSums(is.na(data.tmp))<ncol(data.tmp),] 
+rm(data.tmp)
+cat(sprintf('Dimension of updated data matrix: %d x %d\n', dim(dataF264_v4ny)[1],dim(dataF264_v4ny)[2]))
+# normalize
+dataF264_norm <- dataF264_v4 %>%
+  mutate_each_(list(~scale(.) %>% as.vector),
+                                  vars = 3:ncol(dataF264_v4))
+dataF264_norm.ny <- dataF264_v4ny %>%
+  mutate_each_(list(~scale(.) %>% as.vector),
+                                  vars = 3:ncol(dataF264_v4ny)) %>%
+  as.matrix(.)
+# Create metadata based on phenotype names
+# including Age	Trait	Trait_type
+Trait <- colnames(dataF264_norm)[3:ncol(dataF264_v4)] %>%
+  gsub('Adj_', '', .)
+Trait.ny <- colnames(dataF264_norm.ny)[3:ncol(dataF264_v4ny)] %>%
+  gsub('Adj_', '', .)
+Age <- colnames(dataF264_norm)[3:ncol(dataF264_v4)] %>%
+  substr(.,(nchar(.)+1)-2,nchar(.))
+Age.ny <- colnames(dataF264_norm.ny)[3:ncol(dataF264_v4ny)] %>%
+  substr(.,(nchar(.)+1)-2,nchar(.))
+Trait_type_n <- c(rep("Production",2),rep("Quality",3),rep("Production",4),rep("Quality",1)) # ,rep("Fitness",4)
+Trait_type <- c(rep("Production",3),rep("Quality",6),rep("Production",4),rep("Quality",2))
+phen.meta <- data.frame(Trait,Age,Trait_type)
+phen.meta.ny <- data.frame(Trait.ny,Age.ny,Trait_type_n)
+summary <- summary[-c(1,2)] 
+summary <- summary %>%
+  select(-c(Adj_Kvar_47,Adj_Lev_10,Adj_Lev_14,Adj_Lev_26,Adj_Lev_47,Adj_Vit_10, Adj_Vit_14,Adj_Vit_26,Adj_Vit_47,Adj_Rak_14,Adj_Fstam_47,Adj_Sdbst_14))
+phen.meta <- data.frame(phen.meta, t(summary)) %>%
+  rename(Records = t.summary.)
+summary.n <- summary %>% 
+  select(-c(Adj_Gdiagr130_14,Adj_Gvingr130_14, Adj_Gant_14,Adj_Dia_14, Adj_Sprant_14))
+phen.meta.ny <- data.frame(phen.meta.ny, t(summary.n)) %>%
+  rename(Records = t.summary.n.) %>%
+  rename(Trait_type = Trait_type_n,Age = Age.ny, Trait = Trait.ny)
+# save trait metadata
+write.table(phen.meta,file = "phen_meta.txt",quote=FALSE,sep="\t")
+write.table(phen.meta.ny,file = "phen_meta_trait10_records6044.txt",quote=FALSE,sep="\t")
+```
+
+## SVD PCA
+
+```{r}
+# Define colors for the cluster groups 
+cluster_colors <- c("#1f77b4", "#ff7f0e")  # Blue and Orange
+#calculate principal components
+results <- prcomp(dataF264_norm[,3:ncol(dataF264_norm)], scale = TRUE,center = TRUE)
+results$Genotype_id <- dataF264_norm$Genotype_id
+# Access the proportion of variance explained by each PC
+variance_explained <- results$sdev^2 / sum(results$sdev^2)
+
+cat(sprintf("Variance explained:\n"))
+print(var_explained)
+
+# Create a scree plot
+plot(1:length(variance_explained), variance_explained, type = "b",
+     xlab = "Principal Component", ylab = "Proportion of Variance Explained",
+     main = "Scree Plot")
+# Create a data frame for plotting
+plot_data <- data.frame(
+  PC = as.factor(paste0("PC",1:length(variance_explained))),
+  VarianceExplained = variance_explained*100
+)
+# Reorder the factor levels of PC based on VarianceExplained
+plot_data <- plot_data %>%
+  mutate(PC = fct_reorder(PC, VarianceExplained, .desc = TRUE))
+
+# Create a bar plot using ggplot2
+plvar <- ggplot(plot_data, aes(x = PC, y = VarianceExplained)) +
+  geom_bar(stat = "identity", fill = "steelblue",color = "black") +
+  labs(
+    x = "",
+    y = "Variance explained (%)",
+    title = ""
+  ) +
+ # scale_x_continuous(breaks = 1:15) +  # Set the x-axis breaks from 1 to 15
+  theme_minimal() + 
+  theme(axis.text = element_text(size=11, color = "black"), axis.title = element_text(size = 11),
+        axis.text.x = element_text(angle = 45)); plvar
+ggsave(filename = "variance_explained_1685_SVDPCA.png",plot = plvar)
+ggsave(filename = "variance_explained_1685_SVDPCA.pdf",plot = plvar)
+
+# score plot
+PC <- as.data.frame(results$x)
+p1 <- ggplot(PC, aes(x = PC1, y = PC2)) + 
+  geom_point(); p1
+ggsave(filename = "pc1vs2_phenotypes.png",plot = p1)
+ggsave(filename = "pc1vs2_phenotypes.pdf",plot = p1)
+
+# loading plot
+# PC1 vs PC2
+PC <- as.data.frame(results$rotation)
+PC <- cbind(PC,phen.meta)
+p2 <- ggplot(PC, aes(x = PC1, y = PC2,color = Trait_type)) +
+  geom_point(size=2) +
+  scale_color_manual(values = cluster_colors) +
+   theme(axis.text = element_text(size = 11,color = "black"),legend.text = element_text(size = 11)) +
+  theme_minimal() +
+  geom_text(
+    label=PC$Trait,
+    nudge_x=0.03, nudge_y=0.03,
+    check_overlap=T,
+color = "black",
+  size = 3)  +
+  labs(color='Trait category') +
+  xlab("PC1 (35.6%)") +
+  ylab("PC2 (13.7%)"); p2
+ggsave(filename = "pc1vs2_phenotypes_1685.png",plot = p2)
+ggsave(filename = "pc1vs2_phenotypes_1685.pdf",plot = p2)
+# PC1 vs PC3
+p3 <- ggplot(PC, aes(x = PC1, y = PC3,color = Trait_type)) +
+  geom_point(size=2) +
+  theme_minimal() +
+  scale_color_manual(values = cluster_colors) +
+  geom_text(
+    label=PC$Trait,
+    nudge_x=0.03, nudge_y=0.03,
+    check_overlap=T,
+color = "black",
+  size = 3)+
+  theme(axis.text = element_text(size = 11,color = "black"),legend.text = element_text(size = 11)) +
+  labs(color = "Trait category") +
+  xlab("PC1 (35.6%)") +
+  ylab("PC3 (8.8%)"); p3
+ggsave(filename = "pc1vs3_phenotypes_1685.png",plot = p3)
+ggsave(filename = "pc1vs3_phenotypes_1685.pdf",plot = p3)
+biplot(results,cex = 0.2)
+# PC2 vs PC3
+p4 <- ggplot(PC, aes(x = PC2, y = PC3,color = Trait_type)) +
+  geom_point(size=2) +
+  scale_color_manual(values = cluster_colors) +
+    labs(color = "Trait category") +
+  theme_minimal() +
+  geom_text(
+    label=PC$Trait,
+    nudge_x=0.03, nudge_y=0.03,
+    check_overlap=T,
+color = "black",
+  size = 3)+
+    theme(axis.text = element_text(size = 11,color = "black"),legend.text = element_text(size = 11)) +
+  xlab("PC1 (35.6%)") +
+  ylab("PC3 (13.7%)"); p4
+ggsave(filename = "pc2vs3_phenotypes_1685.png",plot = p3)
+ggsave(filename = "pc2vs3_phenotypes_1685.pdf",plot = p3)
+biplot(results,cex = 0.2)
+
+# Create the PCA biplot
+fviz_pca_biplot(results, 
+                col.var="contrib",
+                gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+                geom.ind = "point", # Show points only (individuals)
+                geom.var = "arrow", # Show arrows only (variables)
+                repel = TRUE,       # Avoid text overlapping
+                addEllipses = TRUE  # Add confidence ellipses
+                ) +
+  theme_minimal() +
+  ggtitle("")
+# Visualize eigenvalues/variances
+psc <- fviz_screeplot(results, addlabels = TRUE, ylim = c(0, 50)) +
+  theme(axis.title.y = element_text(size = 11)); psc
+fviz_pca_var(results, col.var = "black")
+rownames(results$rotation) <- gsub('Adj_', '', rownames(results$rotation))
+# Control variable colors using their contributions
+pc12 <- fviz_pca_var(results, 
+             col.var="contrib",
+             geom.var = c("arrow", "text"),
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE # Avoid text overlapping
+             ) +
+  theme(axis.text = element_text(size = 11, color = "black")) + 
+  labs(color = "Contribution", title =""); pc12
+ggsave(filename = "ex_pc1_pc2_loadings.png",plot = pc12,dpi = 300)
+pc13 <- fviz_pca_var(results, 
+             col.var="contrib",
+             axes = c(1, 3),
+             geom.var = c("arrow", "text"),
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE # Avoid text overlapping
+             ) +
+  theme(axis.text = element_text(size = 11, color = "black")) + 
+  labs(color = "Contribution", title =""); pc13
+# Contributions of variables to PC1
+pcont1 <- fviz_contrib(results, choice = "var", axes = 1, top = 15) + 
+  theme(axis.text = element_text(size = 11, color = "black"),
+        axis.title = element_text(size = 11)) +
+  labs(title = ""); pcont1
+
+# Contributions of variables to PC2
+pcont2 <- fviz_contrib(results, choice = "var", axes = 2, top = 15) + 
+  theme(axis.text = element_text(size = 11, color = "black"),
+        axis.title = element_text(size = 11)) +
+  labs(title = ""); pcont2
+
+fviz_pca_ind(results, col.ind = "cos2", 
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE # Avoid text overlapping (slow if many points)
+             )
+```
+
+## BPCA
+Similar to probabilistic PCA, Bayesian PCA uses an EM approach together with a Bayesian model to calculate the likelihood for a reconstructed value. The algorithm seems to be tolerant to relatively high amounts of missing data ($> 10\%$). Scores and loadings obtained with Bayesian PCA slightly differ from those obtained with conventional PCA. This is because BPCA was developed especially for missing value estimation and is based on a variational Bayesian framework (VBF), with automatic relevance determination (ARD). In BPCA, ARD leads to a different scaling of the scores, loadings and eigenvalues when compared to standard PCA or PPCA. The algorithm does not force orthogonality between loadings. However, the authors of the BPCA paper found that including an orthogonality criterion made the predictions worse. They also state that the difference between "real" and predicted Eigenvalues becomes
+larger when the number of observation is smaller, because it refects the lack of information to accurately determine true loadings from the limited and noisy data. As a result, weights of factors to predict missing values are not the same as with conventional PCA, but the missing value estimation is improved. BPCA was proposed by Oba et al. <br>
+Oba S. and Sato MA. and Takemasa I. and Monden M. and Matsubara <br>
+K. and Ishii S. A Bayesian missing value estimation method for gene<br>
+expression profle data. Bioinformatics. 2003 Nov 1;19(16):2088-96.
+```{r}
+# for comparison bpca on small dataset
+results.bpca <- pca(dataF264_norm[,3:ncol(dataF264_norm)], method = "bpca", nPcs = 5, verbose = TRUE,maxSteps = 10000,threshold = 1e-05)
+# test with including na
+results.na <- pca(dataF264_norm.ny[,3:ncol(dataF264_norm.ny)], method = "bpca", nPcs = 9, verbose = TRUE,maxSteps = 5000,threshold = 1e-04)
+summary(results.na)
+dataF264_norm.ny <- as.data.frame(dataF264_norm.ny)
+missing_summary <- dataF264_norm.ny %>%
+  select(-c(Genotype_id,Family_id)) %>%
+  summarise_all(~ sum(is.na(.))) %>%
+  mutate(proportion = sum(.)/(dim(dataF264_norm.ny)[1]*dim(dataF264_norm.ny)[2]))
+
+# Print the number and proportion of missing data for each column
+print(missing_summary)
+## Get the estimated principal axes (loadings)
+loadings <- loadings(results.na) 
+## Get the estimated scores
+sc <- results.na@scores %>%
+  as.data.frame()
+colnames(loadings) <- paste('PC',seq(1,9),sep="")
+colnames(sc) <- paste('PC',seq(1,9),sep="")
+rownames(sc) <- rownames(dataF264_norm.ny)
+sc$Genotype_id <- dataF264_norm.ny$Genotype_id
+sc$Family_id <- dataF264_norm.ny$Family_id
+
+imputed <- completeObs(results.na)
+#calculate principal components on imputed data for comparison with BPCA
+results.imp <- prcomp(imputed, scale = TRUE)
+PC.imp <- as.data.frame(results.imp$x) %>%
+  mutate(Genotype_id = as.factor(dataF264_norm.ny$Genotype_id)) %>%
+  mutate(Family_id = as.factor(dataF264_norm.ny$Family_id))
+## Now make a scores and loadings plot
+slplot(results.na)
+R2val <- R2cum(results.na)
+R2 <- R2val 
+
+for (i in 2:length(R2val)){
+  R2[i] <- R2val[i]-R2val[i-1]
+}
+R2 <- R2 %>% 
+  as.data.frame() %>%
+  rownames_to_column(var = "PC")
+rownames(R2) <- paste("PC",seq(1,9),sep="")
+colnames(R2) <- c("PC","Variance_explained")
+pvarex <- ggplot(data=R2,aes(x = PC, y = Variance_explained)) +
+  geom_bar(stat="identity", width=0.5, fill = "steelblue",color = "black") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  ylab("Variance proportion") +
+  xlab("Principal component"); pvarex
+ggsave(filename = "Var_explained_n6011_p10_pc9.png",plot = pvarex)
+ggsave(filename = "Var_explained_n6011_p10_pc9.pdf",plot = pvarex)
+
+PCn <- cbind(phen.meta.ny,loadings)
+ 
+p1ny <- ggplot(PCn, aes(PC1, PC2, colour=Trait_type)) +
+  geom_point(size=2) +
+    # Customize the color scale using the predefined palette
+  scale_color_manual(values = cluster_colors) +
+  geom_text(
+    label=PCn$Trait,
+    nudge_x=0.03, nudge_y=0.03,
+    check_overlap=T,
+color = "black")  +
+  xlab("PC1 (48.7%)") +
+  ylab("PC2 (16.9%)"); p1ny
+p2ny <- ggplot(PCn, aes(PC1, PC3, colour=Trait_type)) +
+  geom_point(size=2) +
+    # Customize the color scale using the predefined palette
+  scale_color_manual(values = cluster_colors) +
+  geom_text(
+    label=PCn$Trait,
+    nudge_x=0.03, nudge_y=0.03,
+    check_overlap=T,
+color = "black")  +
+  xlab("PC1 (48.7%)") +
+  ylab("PC3 (10.6%)"); p2ny
+ggsave(filename = "pc1vs2_phenotypes_n6011_p10.png",plot = p1ny)
+ggsave(filename = "pc1vs2_phenotypes_n6011_p10.png",plot = p1ny)
+ggsave(filename = "pc1vs3_phenotypes_n6011_p10.pdf",plot = p2ny)
+ggsave(filename = "pc1vs3_phenotypes_n6011_p10.pdf",plot = p2ny)
+```
+
+## Hierechichal clustering
+
+```{r}
+dataF264_norm2 <- dataF264_norm[,3:ncol(dataF264_norm)] %>%
+  rename_with(~gsub("^Adj_", "", .), starts_with("Adj_"))
+
+# Compute distances and hierarchical clustering
+dd <- dist(scale(t(dataF264_norm2)), method = "euclidean")
+hc <- hclust(dd, method = "ward.D2")
+
+groups <- cutree(hc,k = 2)
+
+dend <- hc %>%
+  as.dendrogram %>%
+   set("branches_k_color", value = cluster_colors, k=2) %>% 
+  set("branches_lwd", 3) %>%
+  set("labels_cex", 0.9) %>%
+  set("leaves_pch",19) #%>%
+
+# plot the dend in usual "base" plotting engine:
+plot(dend)
+phc1 <- plot(dend); phc1
+dend.1685 <- dend
+png(filename = "dendrogram_trait_1685_15trait.png")
+plot(dend)
+dev.off()
+postscript(file = "dendrogram_trait_1685_15trait.eps")
+plot(dend)
+dev.off()
+pdf(file = "dendrogram_trait_1685_15trait.pdf")
+plot(dend)
+dev.off()
+rm(dataF264_norm2)
+
+dataF264_norm2 <- dataF264_norm.ny[,3:ncol(dataF264_norm.ny)] %>%
+  as.data.frame() %>%
+  rename_with(~gsub("^Adj_", "", .), starts_with("Adj_"))
+# Compute distances and hierarchical clustering
+dd <- dist(scale(t(dataF264_norm2)), method = "euclidean")
+hc <- hclust(dd, method = "ward.D2")
+
+groups <- cutree(hc,k = 2)
+
+dend <- hc %>%
+  as.dendrogram %>%
+   set("branches_k_color", value = cluster_colors, k=2) %>% 
+  set("branches_lwd", 3) %>%
+  set("labels_cex", 0.9) %>%
+  set("leaves_pch",19) #%>%
+  #set("leaves_col", value = groups, k = 2)
+# plot the dend in usual "base" plotting engine:
+plot(dend)
+phc2 <- plot(dend); phc2
+dend.6044 <- dend
+png(filename = "dendrogram_trait_6044_10trait.png")
+plot(dend)
+dev.off()
+postscript(file = "dendrogram_trait_6044_10trait.eps")
+plot(dend)
+dev.off()
+pdf(file = "dendrogram_trait_6044_10trait.pdf")
+plot(dend)
+dev.off()
+rm(dataF264_norm2)
+
+# Set up the plotting layout
+par(mfrow = c(1, 2))  # Define the number of rows and columns
+
+# Plot the first figure
+plot(dend.1685, main = "a")
+
+# Plot the second figure
+plot(dend.6044, main = "b")
+
+# ... Add more plots as needed ...
+# Reset the plotting layout to default
+par(mfrow = c(1, 1))
+
+
+png(filename = "joint_dendrogram.png")
+par(mfrow = c(1, 2))  # Define the number of rows and columns
+# Plot the first figure
+plot(dend.1685, main = "a")
+
+# Plot the second figure
+plot(dend.6044, main = "b")
+# Reset the plotting layout to default
+par(mfrow = c(1, 1))
+dev.off()
+postscript(file = "joint_dendrogram.eps")
+par(mfrow = c(1, 2))  # Define the number of rows and columns
+# Plot the first figure
+plot(dend.1685, main = "a")
+
+# Plot the second figure
+plot(dend.6044, main = "b")
+# Reset the plotting layout to default
+par(mfrow = c(1, 1))
+dev.off()
+pdf(file = "Supplementary_figure_S2.pdf")
+par(mfrow = c(1, 2))  # Define the number of rows and columns
+# Plot the first figure
+plot(dend.1685, main = "a")
+
+# Plot the second figure
+plot(dend.6044, main = "b")
+# Reset the plotting layout to default
+par(mfrow = c(1, 1))
+dev.off()
+
+```
+
+## Procrustes analysis of ordinations
+Procrustes analysis involves translating, rotating, and scaling one ordination to best match another. This process minimizes the sum of squared differences between the two ordinations, making it easier to visually and quantitatively compare them.
+```{r}
+## Get the estimated principal axes (loadings)
+# 1685 ind data
+loadings.b <- loadings(results.bpca) %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  mutate(Method = "BPCA") %>%
+  rename(Trait = rowname) %>%
+  select(-c(PC4,PC5))
+
+loadings <- results$rotation %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  mutate(Method = "SVD-PCA") %>%
+  mutate(PC1 = - PC1) %>%
+  mutate(PC2 = - PC2) %>%
+  rename(Trait = rowname) %>%
+  select(c(Trait,PC1,PC2,PC3,Method))
+loadings.1685 <- rbind(loadings,loadings.b)
+# Create a color-blind friendly palette for the 'Method' variable
+color_palette <- c("#0072B2", "#D55E00", "#CC79A7")
+
+# Create the scatter plot
+pl1 <- ggplot(loadings.1685, aes(x = PC1, y = PC2, color = Method, shape = Method, label = Trait)) +
+  geom_point(size = 3) +  # Adjust the size of points
+  scale_color_manual(values = color_palette) +  # Apply the color palette
+  scale_shape_manual(values = c(19, 17, 15, 16)) +  # Use different shapes
+  labs(x = "PC1", y = "PC2") +
+  ggtitle("1685 individuals, 15 traits") +
+  geom_text(aes(hjust = -0.1, vjust = 0), size = 3, color = "black") +  # Add text labels
+  theme_minimal(); pl1  # Use a minimal theme for a clean plot
+ggsave(filename = "loadings_comparison_1685.png",plot = pl1)
+ggsave(filename = "loadings_comparison_1685.pdf",plot = pl1)
+loadings.b <- loadings(results.bpca)
+d1 <- dist(loadings.b)
+d2 <- dist(results$rotation[,seq(1,5)]) # [,seq(1,5)]
+mantel(d1, d2)
+## Get the estimated scores
+scores.b <- results.bpca@scores %>%
+  as.data.frame()
+colnames(loadings.b) <- colnames(scores.b) <- paste('PC',seq(1,5),sep="")
+rownames(scores.b) <- rownames(dataF264_norm)
+scores.b$Genotype_id <- as.factor(dataF264_norm$Genotype_id)
+scores.b$Family_id <- as.factor(dataF264_norm$Family_id)
+
+# Perform Procrustes analysis
+procrustes_result <- procrustes(d1, d2)
+
+# Get the Procrustes correlation coefficient
+procrustes_result
+plot(procrustes_result)
+summary(procrustes_result)
+# Print the Procrustes correlation coefficient
+print(correlation)
+###################################################
+# 6044 imputed data
+loadings.b6044 <- loadings(results.na) 
+# Create a color-blind friendly palette for the 'Method' variable
+color_palette <- c("#0072B2", "#D55E00", "#CC79A7")
+
+
+d1 <- dist(loadings.b6044)
+d2 <- dist(results.imp$rotation[,seq(1,9)])
+mantel(d1, d2)
+loadings.b6044 <- loadings(results.na)  %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  mutate(Method = "BPCA") %>%
+  rename(Trait = rowname) %>%
+  select(c(Trait,PC1,PC2,PC3,Method))
+
+loadings <- results.imp$rotation %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  mutate(Method = "SVD-PCA") %>%
+  mutate(PC1 = PC1) %>%
+  mutate(PC2 = PC2) %>%
+  rename(Trait = rowname) %>%
+  select(c(Trait,PC1,PC2,PC3,Method))
+loadings.6044 <- rbind(loadings,loadings.b6044)
+# Create the scatter plot
+pl2 <- ggplot(loadings.6044, aes(x = PC1, y = PC2, color = Method, shape = Method, label = Trait)) +
+  geom_point(size = 3) +  # Adjust the size of points
+  scale_color_manual(values = color_palette) +  # Apply the color palette
+  scale_shape_manual(values = c(19, 17, 15, 16)) +  # Use different shapes
+  labs(x = "PC1", y = "PC2") +
+  ggtitle("6044 individuals, 10 traits") +
+  geom_text(aes(hjust = -0.1, vjust = 0), size = 3, color = "black") +  # Add text labels
+  theme_minimal(); pl2  # Use a minimal theme for a clean plot
+ggsave(filename = "loadings_comparison_6044.png",plot = pl2)
+ggsave(filename = "loadings_comparison_6044.pdf",plot = pl2)
+
+merged_plot <- plot_grid(
+  pl1,  # The first plot
+  pl2,  # The second plot
+  labels = c("A", "B"),  # Labels for each plot (optional)
+  ncol = 1  # Number of columns in the layout (e.g., 2 for side by side)
+); merged_plot
+ggsave(filename = "merged_BBPC_SVDPCA_comparison_loadings.png",plot = merged_plot)
+ggsave(filename = "merged_BBPC_SVDPCA_comparison_loadings.pdf",plot = merged_plot)
+
+## Get the estimated scores
+scores.b6044 <- results.na@scores %>%
+  as.data.frame()
+colnames(scores.b6044) <- paste('PC',seq(1,9),sep="")
+rownames(scores.b6044) <- rownames(dataF264_norm.ny)
+scores.b6044$Genotype_id <- as.factor(dataF264_norm.ny$Genotype_id)
+scores.b6044$Family_id <- as.factor(dataF264_norm.ny$Family_id)
+
+# Perform Procrustes analysis
+procrustes_result <- procrustes(d1, d2)
+
+# Get the Procrustes correlation coefficient
+procrustes_result
+plot(procrustes_result)
+summary(procrustes_result)
+# Print the Procrustes correlation coefficient
+print(correlation)
+
+```
+
+
+## Calculate the numerator relationship matrix
+Uses nadiv R package
+```{r}
+# remove genetic groups
+pedigreeF264btmp <- pedigreeF264[9:nrow(pedigreeF264),1:3]
+# replace groups in mom and dad columns with 0
+pedigreeF264btmp <- pedigreeF264btmp %>%
+  mutate(across(everything(), ~ ifelse(grepl("\\[Pinus_sylvestris\\]", .), 0, .))) %>%
+  mutate(Genotype_id = as.numeric(Genotype_id)) %>%
+  arrange(Genotype_id)
+
+colnames(renped) <- c("Individual","p1","p2")
+colnames(pedigreeF264btmp)  <- c("Individual","p1","p2")
+Amat <- as.matrix(makeA(pedigreeF264btmp))
+
+```
+## ASReml analysis of original phenotypes
+Info of the analyzed subset:<br>
+Number of genotypes in list        	  1685<br>
+Number of genotypes in pedigree    	  1744<br>
+Number of genetic groups           	     8<br>
+Number of base genotypes           	   103<br>
+Number of families                 	   213<br>
+Number of aggregates               	     0<br>
+Number of mixes                    	     0<br>
+Number of parents                  	    59
+```{r}
+# Fix pedigrees
+# Get relevant genotypes in F1
+colnames(pedigreeF264btmp) <- c("Genotype_id","Mum","Dad")
+pedF1 <- pedigreeF264btmp
+filtered_pedF1 <- pedF1 %>%
+  filter(Genotype_id %in% dataF264_norm$Genotype_id)
+dataF264_norm2 <- dataF264_norm %>%
+  filter(Genotype_id %in% as.numeric(filtered_pedF1$Genotype_id))
+
+ainv <- ainverse(pedF1)
+####################### padataF264_v2####################### pair-wise analysis ############################
+
+df_lists <- dataF264_norm2  %>% 
+  select(-c(Genotype_id,Family_id)) %>%
+  summarise_all(list) %>% 
+  pivot_longer(cols = everything(), 
+               names_to = "var", 
+               values_to = "vector") %>% 
+  print()
+
+df_lists_comb <- combn(df_lists$var,2) 
+rownames(df_lists_comb) <- c("Trait1","Trait2")
+
+####################################################################
+# First run all traits as single outcomes to provide starting values
+G <- R <- matrix(0,1,nrow(df_lists))
+colnames(G) <- colnames(R) <- df_lists$var
+h2.s <- data.frame(Estimate = 0, SE = 0, Trait = "NA")
+for(i in 1:nrow(df_lists)){
+  trait <- df_lists$var[i]
+  Dat <- dataF264_norm2 %>% 
+    select(c(Genotype_id,Family_id,trait)) %>%
+    rename(Trait = all_of(trait)) %>%
+    mutate(across(c(Genotype_id,Family_id),
+factor))
+
+  cat(sprintf('Run %d\nAnalyzing trait %s\n',i,trait))
+  # Univariate run
+  res.as <- asreml(Trait ~ 1, 
+                   random = ~vm(Genotype_id, ainv), 
+                   maxit = 20, 
+                   ai.sing=TRUE, 
+                   data = Dat)
+  summary(res.as)$varcomp
+  G[i] <- summary(res.as)$varcomp[1,1]
+  R[i] <- summary(res.as)$varcomp[2,1]
+  tmp <- vpredict(res.as, h2 ~ V1/(V1+V2)) %>%
+    mutate(Trait = trait)
+  rownames(tmp) <- paste("h2_",trait,sep="")
+  h2.s[nrow(h2.s)+1,] <- tmp
+}
+
+h2.s <- h2.s[-1,]
+##### print univariate heritability estimates
+print(h2.s)
+# ASReml call
+res.list <- list()
+start.val.add = start.val.res <- c(0,0.01,0)
+nr <- ncol(df_lists_comb)  
+nr2 <-  nrow(df_lists)
+nr3 <- nr/nr2
+iv.R <- iv.G <- data.frame(Component = rep("NA",nr),Value = rep(0,nr),Constraint = rep("P",nr))
+iv.R2 <- iv.G2 <- data.frame(Component = rep("NA",nr2),Value = rep(0,nr2),Constraint = rep("P",nr2))
+corr <- matrix(0,nr2,nr2)
+rownames(iv.G2) <- rownames(iv.R2) <- rownames(corr) <- colnames(corr) <- df_lists$var
+diag(corr) <- rep(1,nrow(corr))
+
+for(i in 1:ncol(df_lists_comb)){
+  cat(sprintf('*******************\ni = %d\n\nTrait 1: %s, trait 2: %s\n',i,df_lists_comb[1,i],df_lists_comb[2,i]))
+  start.val.add[1] <- G[1,which(dimnames(G)[[2]]==df_lists_comb[1,i])]
+  start.val.add[3] <- G[1,which(dimnames(G)[[2]]==df_lists_comb[2,i])]
+  start.val.res[1] <- R[1,which(dimnames(R)[[2]]==df_lists_comb[1,i])]
+  start.val.res[3] <- R[1,which(dimnames(R)[[2]]==df_lists_comb[2,i])] 
+
+  res.list[[i]] <- bivar(trait1 = df_lists_comb[1,i], trait2 = df_lists_comb[2,i], data = dataF264_norm2,ainv = ainv,start.val.add = start.val.add,start.val.res = start.val.res) 
+
+  iv.G$Component[i] <- paste('trait:vm(Genotype_id, ainv)!trait_',df_lists_comb[1,i],":",df_lists_comb[2,i],sep="")
+  iv.R$Component[i] <- paste('units:trait!trait_',df_lists_comb[1,i],":",df_lists_comb[2,i],sep="")
+  corr[df_lists_comb[1,i],df_lists_comb[2,i] ]<- corr[df_lists_comb[2,i],df_lists_comb[1,i] ] <- res.list[[i]]$vparameters[2]/sqrt(res.list[[i]]$vparameters[1] * res.list[[i]]$vparameters[3])
+  iv.G$Value[i] <- res.list[[i]]$vparameters[2]
+  iv.R$Value[i] <- res.list[[i]]$vparameters[6]
+  iv.G2[df_lists_comb[1,i],1] <- paste('trait:vm(Genotype_id, ainv)!trait_',df_lists_comb[1,i],":",df_lists_comb[1,i],sep="")
+  iv.G2[df_lists_comb[2,i],1] <- paste('trait:vm(Genotype_id, ainv)!trait_',df_lists_comb[2,i],":",df_lists_comb[2,i],sep="")
+  iv.G2[df_lists_comb[1,i],2] <- res.list[[i]]$vparameters[1]
+  iv.G2[df_lists_comb[2,i],2] <- res.list[[i]]$vparameters[3]
+  iv.R2[df_lists_comb[1,i],2] <- res.list[[i]]$vparameters[5]
+  iv.R2[df_lists_comb[2,i],2] <- res.list[[i]]$vparameters[7]
+}
+
+
+iv.G <- rbind(iv.G,iv.G2)
+iv.R <- rbind(iv.R,iv.R2)
+saveRDS(object = res.list,file = "run_asreml_bivariate_v2.RData")
+res.list <- readRDS(file = "run_asreml_bivariate.RData")
+write.table(x = iv.G,file = "genetic_covariances_asreml_bivariate.txt",quote=F,sep="\t",row.names = F)
+write.table(x = iv.R,file = "residual_covariances_asreml_bivariate.txt",quote=F,sep="\t",row.names = F)
+write.table(x = corr,file = "genetic_correlations_asreml_bivariate.txt",quote=F,sep="\t",row.names = F)
+corr <- read.table(file = "genetic_correlations_asreml_bivariate.txt",header = T,sep="\t") %>% 
+  rename_all(~gsub("^Adj_", "", .))
+rownames(corr) <- colnames(corr)
+corr <-  corr %>% rownames_to_column()
+# Plot genetic and residual correlations
+corr.melt <- reshape2::melt(corr)
+colnames(corr.melt) <- c("Trait1","Trait2","Correlation")
+
+pc <- ggplot(data = corr.melt, aes(Trait2, Trait1, fill = Correlation))+
+ geom_tile(color = "white")+
+  labs(fill = "Correlation") +
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 7, hjust = 1),axis.title = element_blank(), legend.text = element_text(size=10), legend.title = element_text(size = 10), axis.text = element_text(size = 7)); pc 
+ ggsave(filename = "heatmap_correlations_asreml.png",plot = pc)
+ ggsave(filename = "heatmap_correlations_asreml.pdf",plot = pc)
+################### plot h2 ###################
+j = 1 
+h2 <- data.frame(Estimate = 0, SE = 0, Trait = "NA",Rep = 0)
+res.list <- readRDS(file = "run_asreml_bivariate_v2.RData")
+for (i in 1:nr){
+  cat(sprintf('Estimating h2 for %d:th combination of traits %s and %s\n',i, df_lists_comb[1,i],df_lists_comb[2,i]))
+  h2.tmp1 <- vpredict(res.list[[i]], h2 ~ V1/(V1+V5)) %>% # NB include family component
+    mutate(Trait = df_lists_comb[1,i]) %>%
+    mutate(Rep = i)
+  rownames(h2.tmp1) = paste("h2_n",j,sep="")
+  h2[nrow(h2) + 1,] = h2.tmp1 
+  j <- j + 1
+    h2.tmp2 <- vpredict(res.list[[i]], h2 ~ V3/(V3+V7)) %>% # NB include family component
+      mutate(Trait = df_lists_comb[2,i]) %>%
+      mutate(Rep = i)
+    rownames(h2.tmp2) = paste("h2_n",j,sep="")
+  j <- j + 1
+  h2[nrow(h2) + 1,] = h2.tmp2 
+}
+h2 <- h2[-1,]
+print(h2)
+Ave.h2 <- h2 %>%
+group_by(Trait) %>%
+summarize(Estimate = mean(Estimate, na.rm=TRUE),
+          SE = mean(SE,na.rm = TRUE)) %>%
+  mutate(Trait = sub("^Adj_", "", Trait))
+
+ph2 <- ggplot(Ave.h2, aes(x = Trait, y = Estimate)) + # reorder(Component,Order)
+  geom_bar(stat = "identity", fill = "blue") +
+  geom_errorbar(aes(ymin = Estimate - SE, ymax = Estimate + SE), width = 0.2, position = position_dodge(width = 0.9)) +
+  labs(title = "",
+       x = "",
+       y = "Heritability") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(colour = "black",size = 10, angle = 45, hjust = 1),axis.text.y = element_text(colour = "black",size = 10)); ph2
+ggsave(filename = "Figures/h2_bivariate.png",plot = ph2)
+ggsave(filename = "Figures/h2_bivariate.pdf",plot = ph2)
+# create joint set
+Ave.h2$Method <- "Bivariate"
+h2.s$Method <- "Univariate"
+joint.h2 <- rbind(Ave.h2,h2.s)
+h2j <- melt(joint.h2,measure.vars = "Estimate") %>%
+  rename(Estimate = value) %>%
+  mutate(Trait = sub("^Adj_", "", Trait))
+
+ph3 <- ggplot(h2j, aes(x = Trait, y = Estimate, fill = Method)) + # reorder(Component,Order)
+  geom_bar(stat = "identity", position=position_dodge()) +
+  geom_errorbar(aes(ymin = Estimate - SE, ymax = Estimate + SE), width = 0.2, position = position_dodge(width = 0.9)) +
+  labs(title = "",
+       x = "Trait",
+       y = "Heritability") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(colour = "black",size = 11, angle = 45, hjust = 1),axis.text.y = element_text(colour = "black",size = 11), legend.text = element_text(size = 11), legend.title = element_text(size = 12), axis.title = element_text(size = 12)) + 
+  scale_fill_manual(values=c('#999999','#E69F00')); ph3
+ggsave(filename = "h2_original_joint_est.png",plot = ph3)
+ggsave(filename = "h2_original_joint_est.pdf",plot = ph3)
+################ Run final model with fixed covariance matrices ################
+# Genotype_id and Family_id as factors
+ dataF264_norm <- dataF264_norm %>% 
+  mutate(Genotype_id = factor(Genotype_id),
+         Family_id = factor(Family_id))
+ final.res <- asreml(
+  fixed = cbind(Adj_Dia_14,Adj_Dia_26, Adj_Dia_47,Adj_Ftopp_47,Adj_Gant_14,Adj_Gdia_26,Adj_Gdiagr130_14, Adj_Gvin_26, Adj_Gvingr130_14, Adj_Hjd_10, Adj_Hjd_14, Adj_Hjd_26, Adj_Hjd_47, Adj_Sprant_14, Adj_Sprant_26) ~ trait,
+  random = ~ us(trait):vm(Genotype_id, ainv),
+  residual = ~ id(units):us(trait),
+  data = dataF264_norm,
+  na.action = na.method(x = "include", y = "include"),
+  maxit = 4218,
+  G.param = iv.G,
+  R.param = iv.R,
+  update.Gcon=FALSE,
+  update.Rcon=FALSE,
+  workspace="2048mb"
+  )
+saveRDS(object = final.res,file = "run_asreml_final_model_BLUP_v2.RData")
+plot(final.res)
+final.res <- readRDS(file = "run_asreml_final_model_BLUP_v2.RData")
+```
+
+## Updated phenotypic record matrix
+10 traits, 6011 individuals, Including NAs <br>
+Number of genotypes in list        	  6044<br>
+Number of genotypes in pedigree    	  6103<br>
+Number of genetic groups           	     8<br>
+Number of base genotypes           	   219<br>
+Number of families                 	   214<br>
+Number of aggregates               	     0<br>
+Number of mixes                    	     0<br>
+Number of parents                  	    59
+```{r}
+# Fix pedigrees
+# Get relevant genotypes in F1
+pedF1 <- pedigreeF264[271:nrow(pedigreeF264),1:3]
+filtered_pedF1 <- pedF1 %>%
+  filter(Genotype_id %in% dataF264_norm.ny[,"Genotype_id"])
+dataF264_norm.ny <- dataF264_norm.ny %>%
+  as.data.frame() %>%
+  filter(Genotype_id %in% as.numeric(filtered_pedF1$Genotype_id))
+
+ainv <- ainverse(tmpped)
+
+####################### pair-wise analysis ############################
+
+df_lists <- dataF264_norm.ny  %>% 
+  as.data.frame() %>%
+  select(-c(Genotype_id,Family_id)) %>%
+  summarise_all(list) %>% 
+  pivot_longer(cols = everything(), 
+               names_to = "var", 
+               values_to = "vector") %>%
+  print()
+
+df_lists_comb <- combn(df_lists$var,2) 
+rownames(df_lists_comb) <- c("Trait1","Trait2")
+
+####################################################################
+# First run all traits as single outcomes to provide starting values
+G <- R <- matrix(0,1,nrow(df_lists))
+colnames(G) <- colnames(R) <- df_lists$var
+h2.s <- data.frame(Estimate = 0, SE = 0, Trait = "NA")
+for(i in 1:nrow(df_lists)){
+  trait <- df_lists$var[i]
+  Dat <- dataF264_norm.ny %>% 
+    as.data.frame() %>%
+    select(c(Genotype_id,Family_id,trait)) %>%
+    rename(Trait = all_of(trait)) %>%
+    mutate(across(c(Genotype_id,Family_id),
+factor))
+
+  cat(sprintf('Run %d\nAnalyzing trait %s\n',i,trait))
+  # Univariate run
+  res.as <- asreml(Trait ~ 1, 
+                   random = ~vm(Genotype_id, ainv), 
+                   maxit = 20, 
+                   ai.sing=TRUE,
+                   data = Dat)
+  summary(res.as)$varcomp
+  G[i] <- summary(res.as)$varcomp[1,1]
+  R[i] <- summary(res.as)$varcomp[2,1]
+  tmp <- vpredict(res.as, h2 ~ V2/(V1+V2)) %>%
+    mutate(Trait = trait)
+  rownames(tmp) <- paste("h2_",trait,sep="")
+  h2.s[nrow(h2.s)+1,] <- tmp
+}
+h2.s <- h2.s[-1,]
+print(h2.s)
+# ASReml call
+res.list <- list()
+start.val.add = start.val.res <- c(0,0.01,0)
+nr <- ncol(df_lists_comb)  
+nr2 <-  nrow(df_lists)
+nr3 <- nr/nr2
+iv.R <- iv.G <- data.frame(Component = rep("NA",nr),Value = rep(0,nr),Constraint = rep("P",nr))
+iv.R2 <- iv.G2 <- data.frame(Component = rep("NA",nr2),Value = rep(0,nr2),Constraint = rep("P",nr2))
+corr <- matrix(0,nr2,nr2)
+rownames(iv.G2) <- rownames(iv.R2) <- rownames(corr) <- colnames(corr) <- df_lists$var
+diag(corr) <- rep(1,nrow(corr))
+for(i in 1:ncol(df_lists_comb)){
+  cat(sprintf('*******************\ni = %d\n\nTrait 1: %s, trait 2: %s\n',i,df_lists_comb[1,i],df_lists_comb[2,i]))
+  start.val.add[1] <- G[1,which(dimnames(G)[[2]]==df_lists_comb[1,i])]
+  start.val.add[3] <- G[1,which(dimnames(G)[[2]]==df_lists_comb[2,i])]
+  start.val.res[1] <- R[1,which(dimnames(R)[[2]]==df_lists_comb[1,i])]
+  start.val.res[3] <- R[1,which(dimnames(R)[[2]]==df_lists_comb[2,i])]
+  # Pick out data
+  Dat <- dataF264_norm.ny %>% 
+    as.data.frame() %>%
+    select(c(Genotype_id,Family_id,df_lists_comb[1,i],df_lists_comb[2,i]))  %>%
+    mutate(across(Genotype_id,factor))
+  res.list[[i]] <- bivar(trait1 = df_lists_comb[1,i], trait2 = df_lists_comb[2,i], data = Dat,ainv = ainv,start.val.add = start.val.add,start.val.res = start.val.res) 
+  iv.G$Component[i] <- paste('trait:vm(Genotype_id, ainv)!trait_',df_lists_comb[1,i],":",df_lists_comb[2,i],sep="")
+  iv.R$Component[i] <- paste('units:trait!trait_',df_lists_comb[1,i],":",df_lists_comb[2,i],sep="")
+  corr[df_lists_comb[1,i],df_lists_comb[2,i] ]<- corr[df_lists_comb[2,i],df_lists_comb[1,i] ] <- res.list[[i]]$vparameters[2]/sqrt(res.list[[i]]$vparameters[1] * res.list[[i]]$vparameters[3])
+  iv.G$Value[i] <- res.list[[i]]$vparameters[2]
+  iv.R$Value[i] <- res.list[[i]]$vparameters[6]
+  iv.G2[df_lists_comb[1,i],1] <- paste('trait:vm(Genotype_id, ainv)!trait_',df_lists_comb[1,i],":",df_lists_comb[1,i],sep="")
+  iv.G2[df_lists_comb[2,i],1] <- paste('trait:vm(Genotype_id, ainv)!trait_',df_lists_comb[2,i],":",df_lists_comb[2,i],sep="")
+  iv.G2[df_lists_comb[1,i],2] <- res.list[[i]]$vparameters[1]
+  iv.G2[df_lists_comb[2,i],2] <- res.list[[i]]$vparameters[3]
+  iv.R2[df_lists_comb[1,i],2] <- res.list[[i]]$vparameters[5]
+  iv.R2[df_lists_comb[2,i],2] <- res.list[[i]]$vparameters[7]
+}
+iv.G <- rbind(iv.G,iv.G2)
+iv.R <- rbind(iv.R,iv.R2)
+saveRDS(object = res.list,file = "run_asreml_bivariate_10trait_6011records.RData")
+write.table(x = iv.G,file = "genetic_covariances_asreml_bivariate_10trait_6011_records.txt",quote=F,sep="\t",row.names = F)
+write.table(x = iv.R,file = "residual_covariances_asreml_bivariate_10trait_6011_records.txt",quote=F,sep="\t",row.names = F)
+write.table(x = corr,file = "genetic_correlations_asreml_bivariate_10trait_6011_records.txt",quote=F,sep="\t",row.names = F)
+corr <- read.table(file = "genetic_correlations_asreml_bivariate_10trait_6011_records.txt",header = T,sep="\t") %>% 
+  rename_all(~gsub("^Adj_", "", .))
+rownames(corr) <- colnames(corr)
+corr <-  corr %>% rownames_to_column()
+# Plot genetic and residual correlations
+corr.melt <- reshape2::melt(corr)
+colnames(corr.melt) <- c("Trait1","Trait2","Correlation")
+
+pc.p <- ggplot(data = corr.melt, aes(Trait2, Trait1, fill = Correlation))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 10, hjust = 1),axis.title = element_blank()); pc.p #+
+ ggsave(filename = "heatmap_correlations_asreml_10trait_6011_records.png",plot = pc.p)
+ ggsave(filename = "heatmap_correlations_asreml_10trait_6011_records.pdf",plot = pc.p)
+################### plot h2 ###################
+j = 1 
+h2 <- data.frame(Estimate = 0, SE = 0, Trait = "NA",Rep = 0)
+res.list <- readRDS(file = "run_asreml_bivariate_10trait_6011records.RData")
+for (i in 1:nr){
+  cat(sprintf('Estimating h2 for %d:th combination of traits %s and %s\n',i, df_lists_comb[1,i],df_lists_comb[2,i]))
+  h2.tmp1 <- vpredict(res.list[[i]], h2 ~ V1/(V1+V5)) %>% # NB include family component
+    mutate(Trait = df_lists_comb[1,i]) %>%
+    mutate(Rep = i)
+  rownames(h2.tmp1) = paste("h2_n",j,sep="")
+  h2[nrow(h2) + 1,] = h2.tmp1 
+  j <- j + 1
+    h2.tmp2 <- vpredict(res.list[[i]], h2 ~ V3/(V3+V7)) %>% # NB include family component
+      mutate(Trait = df_lists_comb[2,i]) %>%
+      mutate(Rep = i)
+    rownames(h2.tmp2) = paste("h2_n",j,sep="")
+  j <- j + 1
+  h2[nrow(h2) + 1,] = h2.tmp2 
+}
+h2 <- h2[-1,]
+print(h2)
+Ave.h2 <- h2 %>%
+group_by(Trait) %>%
+summarize(Estimate = mean(Estimate, na.rm=TRUE),
+          SE = mean(SE,na.rm = TRUE)) 
+
+ph2 <- ggplot(Ave.h2, aes(x = Trait, y = Estimate)) + # reorder(Component,Order)
+  geom_bar(stat = "identity", fill = "blue") +
+  geom_errorbar(aes(ymin = Estimate - SE, ymax = Estimate + SE), width = 0.2, position = position_dodge(width = 0.9)) +
+  labs(title = "",
+       x = "Heritability",
+       y = "Estimate") +
+  theme_classic() +
+  theme(axis.text.x = element_text(colour = "black",size = 10, angle = 90, hjust = 1),axis.text.y = element_text(colour = "black",size = 10)); ph2
+ggsave(filename = "h2_bivariate_10trait_6011_records.png",plot = ph2)
+ggsave(filename = "h2_bivariate_10trait_6011_records.pdf",plot = ph2)
+# create joint set
+Ave.h2$Method <- "Bivariate"
+h2.s$Method <- "Univariate"
+joint.h2 <- rbind(Ave.h2,h2.s)
+h2j <- melt(joint.h2,measure.vars = "Estimate") %>%
+  rename(Estimate = value)
+ph3 <- ggplot(h2j, aes(x = Trait, y = Estimate, fill = Method)) + # reorder(Component,Order)
+  geom_bar(stat = "identity", position=position_dodge()) +
+  geom_errorbar(aes(ymin = Estimate - SE, ymax = Estimate + SE), width = 0.2, position = position_dodge(width = 0.9)) +
+  labs(title = "",
+       x = "Heritability",
+       y = "Estimate") +
+  theme_classic() +
+  theme(axis.text.x = element_text(colour = "black",size = 10, angle = 90, hjust = 1),axis.text.y = element_text(colour = "black",size = 10)) + scale_fill_manual(values=c('#999999','#E69F00')); ph3
+ggsave(filename = "h2_original_joint_est_10trait_6011_records.png",plot = ph3)
+ggsave(filename = "h2_original_joint_est_10trait_6011_records.pdf",plot = ph3)
+################ Run final model with fixed covariance matrices ################
+# Genotype_id and Family_id as factors
+ dataF264_norm.ny <- dataF264_norm.ny %>% 
+  as.data.frame() %>%
+  mutate(Genotype_id = factor(Genotype_id),
+         Family_id = factor(Family_id))
+ final.res <- asreml(
+  fixed = cbind(Adj_Dia_26, Adj_Dia_47,Adj_Ftopp_47,Adj_Gdia_26, Adj_Gvin_26, Adj_Hjd_10, Adj_Hjd_14, Adj_Hjd_26, Adj_Hjd_47, Adj_Sprant_26) ~ trait,
+  random = ~ us(trait):vm(Genotype_id, ainv),
+  residual = ~ id(units):us(trait),
+  data = dataF264_norm.ny,
+  na.action = na.method(x = "include", y = "include"),
+  maxit = 1000,
+  G.param = iv.G,
+  R.param = iv.R,
+  update.Gcon=FALSE,
+  update.Rcon=FALSE,
+  workspace="2048mb"
+  )
+saveRDS(object = final.res,file = "run_asreml_final_model_BLUP_10trait_6011_records.RData")
+plot(final.res)
+final.res <- readRDS(file = "run_asreml_final_model_BLUP_10trait_6011_records.RData")
+```
+
+## Test with imputed data
+No NA values presented.
+```{r}
+# Read pedigrees + ainv from file
+dataF264_norm.imp <- cbind(dataF264_norm.ny[,1:2],imputed)
+
+# Check if any element in the data frame is NA
+has_na <- any(is.na(dataF264_norm.imp))
+
+# Print the result
+if (has_na) {
+  cat("The data frame contains NA values.\n")
+} else {
+  cat("The data frame does not contain NA values.\n")
+}
+
+write.table(x = dataF264_norm.imp[,"Genotype_id"],file = "genotype_list_w_phenotypes_F264_10traits_6011records_imputed_no_NA.txt",sep = "\n",quote = FALSE, row.names = FALSE)
+pedigreeF264 <- read.table(file = "Pedigree/pedigree.txt",header = TRUE,sep=",")
+ainv <- ainverse(pedigreeF264[,1:3])
+####################### pair-wise analysis ############################
+
+df_lists <- imputed  %>% 
+  as.data.frame() %>%
+  summarise_all(list) %>% 
+  pivot_longer(cols = everything(), 
+               names_to = "var", 
+               values_to = "vector") %>%
+  print()
+
+df_lists_comb <- combn(df_lists$var,2) 
+rownames(df_lists_comb) <- c("Trait1","Trait2")
+
+####################################################################
+# First run all traits as single outcomes to provide starting values
+G <- R <- matrix(0,1,nrow(df_lists))
+colnames(G) <- colnames(R) <- df_lists$var
+h2.i <- data.frame(Estimate = 0, SE = 0, Trait = "NA")
+for(i in 1:nrow(df_lists)){
+  trait <- df_lists$var[i]
+  Dat <- dataF264_norm.imp %>% 
+    as.data.frame() %>%
+    select(c(Genotype_id,Family_id,trait)) %>%
+    rename(Trait = all_of(trait)) %>%
+    mutate(across(c(Genotype_id,Family_id),
+factor))
+
+  cat(sprintf('Run %d\nAnalyzing trait %s\n',i,trait))
+  # Univariate run
+  res.as <- asreml(Trait ~ 1, 
+                   random = ~vm(Genotype_id, ainv), maxit = 20, 
+    ai.sing=TRUE, 
+    data = Dat)
+  summary(res.as)$varcomp
+  G[i] <- summary(res.as)$varcomp[1,1]
+  R[i] <- summary(res.as)$varcomp[2,1]
+  tmp <- vpredict(res.as, h2 ~ V1/(V1+V2)) %>%
+    mutate(Trait = trait)
+  rownames(tmp) <- paste("h2_",trait,sep="")
+  h2.i[nrow(h2.i)+1,] <- tmp
+}
+h2.i <- h2.i[-1,]
+print(h2.i)
+# ASReml call
+res.list <- list()
+start.val.add = start.val.res <- c(0,0.01,0)
+nr <- ncol(df_lists_comb)  
+nr2 <-  nrow(df_lists)
+nr3 <- nr/nr2
+iv.R <- iv.G <- data.frame(Component = rep("NA",nr),Value = rep(0,nr),Constraint = rep("P",nr))
+iv.R2 <- iv.G2 <- data.frame(Component = rep("NA",nr2),Value = rep(0,nr2),Constraint = rep("P",nr2))
+corr <- matrix(0,nr2,nr2)
+rownames(iv.G2) <- rownames(iv.R2) <- rownames(corr) <- colnames(corr) <- df_lists$var
+diag(corr) <- rep(1,nrow(corr))
+for(i in 1:ncol(df_lists_comb)){
+  cat(sprintf('*******************\ni = %d\n\nTrait 1: %s, trait 2: %s\n',i,df_lists_comb[1,i],df_lists_comb[2,i]))
+  start.val.add[1] <- G[1,which(dimnames(G)[[2]]==df_lists_comb[1,i])]
+  start.val.add[3] <- G[1,which(dimnames(G)[[2]]==df_lists_comb[2,i])]
+  start.val.res[1] <- R[1,which(dimnames(R)[[2]]==df_lists_comb[1,i])]
+  start.val.res[3] <- R[1,which(dimnames(R)[[2]]==df_lists_comb[2,i])]
+  # Pick out data
+  Dat <- dataF264_norm.imp %>% 
+    as.data.frame() %>%
+    select(c(Genotype_id,Family_id,df_lists_comb[1,i],df_lists_comb[2,i]))  %>%
+    mutate(across(Genotype_id,factor))
+  res.list[[i]] <- bivar(trait1 = df_lists_comb[1,i], trait2 = df_lists_comb[2,i], data = Dat,ainv = ainv,start.val.add = start.val.add,start.val.res = start.val.res) 
+  iv.G$Component[i] <- paste('trait:vm(Genotype_id, ainv)!trait_',df_lists_comb[1,i],":",df_lists_comb[2,i],sep="")
+  iv.R$Component[i] <- paste('units:trait!trait_',df_lists_comb[1,i],":",df_lists_comb[2,i],sep="")
+  corr[df_lists_comb[1,i],df_lists_comb[2,i] ]<- corr[df_lists_comb[2,i],df_lists_comb[1,i] ] <- res.list[[i]]$vparameters[2]/sqrt(res.list[[i]]$vparameters[1] * res.list[[i]]$vparameters[3])
+  iv.G$Value[i] <- res.list[[i]]$vparameters[2]
+  iv.R$Value[i] <- res.list[[i]]$vparameters[6]
+  iv.G2[df_lists_comb[1,i],1] <- paste('trait:vm(Genotype_id, ainv)!trait_',df_lists_comb[1,i],":",df_lists_comb[1,i],sep="")
+  iv.G2[df_lists_comb[2,i],1] <- paste('trait:vm(Genotype_id, ainv)!trait_',df_lists_comb[2,i],":",df_lists_comb[2,i],sep="")
+  iv.G2[df_lists_comb[1,i],2] <- res.list[[i]]$vparameters[1]
+  iv.G2[df_lists_comb[2,i],2] <- res.list[[i]]$vparameters[3]
+  iv.R2[df_lists_comb[1,i],2] <- res.list[[i]]$vparameters[5]
+  iv.R2[df_lists_comb[2,i],2] <- res.list[[i]]$vparameters[7]
+}
+iv.G <- rbind(iv.G,iv.G2)
+iv.R <- rbind(iv.R,iv.R2)
+saveRDS(object = res.list,file = "run_asreml_bivariate_10trait_6011records_imputed.RData")
+write.table(x = iv.G,file = "genetic_covariances_asreml_bivariate_10trait_6011_records_imputed.txt",quote=F,sep="\t",row.names = F)
+write.table(x = iv.R,file = "residual_covariances_asreml_bivariate_10trait_6011_records_imputed.txt",quote=F,sep="\t",row.names = F)
+write.table(x = corr,file = "genetic_correlations_asreml_bivariate_10trait_6011_records_imputed.txt",quote=F,sep="\t",row.names = F)
+corr <- read.table(file = "genetic_correlations_asreml_bivariate_10trait_6011_records_imputed.txt",header = T,sep="\t") %>% 
+  rename_all(~gsub("^Adj_", "", .))
+rownames(corr) <- colnames(corr)
+corr <-  corr %>% rownames_to_column()
+# Plot genetic and residual correlations
+corr.melt <- reshape2::melt(corr)
+colnames(corr.melt) <- c("Trait1","Trait2","Correlation")
+
+pc.i <- ggplot(data = corr.melt, aes(Trait2, Trait1, fill = Correlation))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 10, hjust = 1),axis.title = element_blank()); pc.i 
+ ggsave(filename = "heatmap_correlations_asreml_10trait_6011_records_imputed.png",plot = pc.i)
+ ggsave(filename = "heatmap_correlations_asreml_10trait_6011_records_imputed.pdf",plot = pc.i)
+################### plot h2 ###################
+j = 1 
+h2.ii <- data.frame(Estimate = 0, SE = 0, Trait = "NA",Rep = 0)
+res.list <- readRDS(file = "run_asreml_bivariate_10trait_6011records_imputed.RData")
+for (i in 1:nr){
+  cat(sprintf('Estimating h2 for %d:th combination of traits %s and %s\n',i, df_lists_comb[1,i],df_lists_comb[2,i]))
+  h2.tmp1 <- vpredict(res.list[[i]], h2 ~ V1/(V1+V5)) %>% # NB include family component
+    mutate(Trait = df_lists_comb[1,i]) %>%
+    mutate(Rep = i)
+  rownames(h2.tmp1) = paste("h2_n",j,sep="")
+  h2.ii[nrow(h2.ii) + 1,] = h2.tmp1 
+  j <- j + 1
+    h2.tmp2 <- vpredict(res.list[[i]], h2 ~ V3/(V3+V7)) %>% # NB include family component
+      mutate(Trait = df_lists_comb[2,i]) %>%
+      mutate(Rep = i)
+    rownames(h2.tmp2) = paste("h2_n",j,sep="")
+  j <- j + 1
+  h2.ii[nrow(h2.ii) + 1,] = h2.tmp2 
+}
+h2.ii <- h2.ii[-1,]
+print(h2.ii)
+Ave.h2 <- h2.ii %>%
+group_by(Trait) %>%
+summarize(Estimate = mean(Estimate, na.rm=TRUE),
+          SE = mean(SE,na.rm = TRUE)) %>% 
+  mutate(Trait = gsub("^Adj_", "", Trait))
+
+ph2 <- ggplot(Ave.h2, aes(x = Trait, y = Estimate)) + 
+  geom_bar(stat = "identity", fill = "blue") +
+  geom_errorbar(aes(ymin = Estimate - SE, ymax = Estimate + SE), width = 0.2, position = position_dodge(width = 0.9)) +
+  labs(title = "",
+       x = "Heritability",
+       y = "Estimate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(colour = "black",size = 10, angle = 90, hjust = 1),axis.text.y = element_text(colour = "black",size = 10)); ph2
+ggsave(filename = "h2_bivariate_10trait_6011_records_imputed.png",plot = ph2)
+ggsave(filename = "h2_bivariate_10trait_6011_records_imputed.pdf",plot = ph2)
+# create joint set
+Ave.h2$Method <- "Bivariate"
+h2.i$Method <- "Univariate"
+h2.i <- h2.i %>% 
+  mutate(Trait = gsub("^Adj_", "", Trait))
+joint.h2 <- rbind(Ave.h2,h2.i)
+h2j.i <- melt(joint.h2,measure.vars = "Estimate") %>%
+  rename(Estimate = value)
+ph3 <- ggplot(h2j.i, aes(x = Trait, y = Estimate, fill = Method)) + # reorder(Component,Order)
+  geom_bar(stat = "identity", position=position_dodge()) +
+  geom_errorbar(aes(ymin = Estimate - SE, ymax = Estimate + SE), width = 0.2, position = position_dodge(width = 0.9)) +
+  labs(title = "",
+       x = "Heritability",
+       y = "Estimate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(colour = "black",size = 10, angle = 90, hjust = 1),axis.text.y = element_text(colour = "black",size = 10)) + scale_fill_manual(values=c('#999999','#E69F00')); ph3
+ggsave(filename = "h2_original_joint_est_10trait_6011_records_imputed.png",plot = ph3)
+ggsave(filename = "h2_original_joint_est_10trait_6011_records_imputed.pdf",plot = ph3)
+################ Run final model with fixed covariance matrices ################
+# Genotype_id and Family_id as factors
+ dataF264_norm.imp <- dataF264_norm.imp %>% 
+  as.data.frame() %>%
+  mutate(Genotype_id = factor(Genotype_id),
+         Family_id = factor(Family_id))
+ final.res.imp <- asreml(
+  fixed = cbind(Adj_Dia_26, Adj_Dia_47,Adj_Ftopp_47,Adj_Gdia_26, Adj_Gvin_26, Adj_Hjd_10, Adj_Hjd_14, Adj_Hjd_26, Adj_Hjd_47, Adj_Sprant_26) ~ trait,
+  random = ~ us(trait):vm(Genotype_id, ainv),
+  residual = ~ id(units):us(trait),
+  data = dataF264_norm.ny,
+  na.action = na.method(x = "include", y = "include"),
+  maxit = 1000,
+  G.param = iv.G,
+  R.param = iv.R,
+  update.Gcon=FALSE,
+  update.Rcon=FALSE,
+  workspace="2048mb"
+  )
+saveRDS(object = final.res.imp,file = "run_asreml_final_model_BLUP_10trait_6011_records_imputed.RData")
+plot(final.res.imp)
+
+```
+
+## Compare BLUP values of imputed and original data
+10 traits available for comparison. Results removed from manuscript.
+```{r}
+EBV_imp <- data.frame(
+  Trait = rownames(final.res.imp$coefficients$random),
+  BLUP = final.res.imp$coefficients$random,
+  SE = sqrt(final.res.imp$vcoeff$random * final.res.imp$sigma2)
+) %>%
+  rename(EBV = bu) %>%
+  mutate(Method = "Imputed")
+EBV_6011 <- data.frame(
+  Trait = rownames(final.res$coefficients$random),
+  BLUP = final.res$coefficients$random,
+  SE = sqrt(final.res$vcoeff$random * final.res$sigma2)
+) %>%
+  rename(EBV = bu) %>%
+  filter(!grepl('Family', Trait)) %>%
+  mutate(Method = "Original")
+# filter only Adj_Hjd_47
+EBV_na_hjd47 <- EBV_6011 %>%
+  filter(grepl("Adj_Hjd_47", Trait)) %>%
+  filter(!grepl("Pinus_sylvestris", Trait)) 
+EBV_imp_hjd47 <- EBV_imp %>%
+  filter(grepl("Adj_Hjd_47", Trait)) %>%
+  filter(!grepl("Pinus_sylvestris", Trait)) 
+cor.test(EBV_imp_hjd47$EBV,EBV_na_hjd47$EBV)
+cor.test(EBV_imp$EBV,EBV_6011$EBV)
+# rename columns for plot
+EBV_6011 <- EBV_6011 %>%
+  rename(EBV.orig = EBV) %>%
+  select(-c(Trait,Method,SE))
+EBV_imp <- EBV_imp %>%
+  rename(EBV.imp = EBV) %>%
+  select(-c(Trait,Method,SE))
+EBV_all <- cbind(EBV_imp,EBV_6011)
+
+p.i <-  ggplot(data = EBV_all, aes(x = EBV.orig, y = EBV.imp)) +
+  geom_point() +
+    theme_minimal() +
+  geom_abline(slope = 1, intercept = 0, color = "red",size = 2) + 
+    theme(axis.text = element_text(size = 12,colour = "black")) +
+    xlab("EBV original data") +
+    ylab("EBV imputed data"); p.i
+ggsave(filename = "compare_imputed_original.png",plot = p.i)
+ggsave(filename = "compare_imputed_original.pdf",plot = p.i)
+
+######################################################
+# Check genetic parameter estimates (scale parameters)
+iv.G.na <- read.table(file = "genetic_covariances_asreml_bivariate_10trait_6011_records.txt",sep="\t",header=T)
+iv.R.na <- read.table(file = "residual_covariances_asreml_bivariate_10trait_6011_records.txt",sep="\t",header=T)
+
+corr.na <- read.table(file = "genetic_correlations_asreml_bivariate_10trait_6011_records.txt",sep="\t",header = T)
+iv.G.imp <- read.table(file = "genetic_covariances_asreml_bivariate_10trait_6011_records_imputed.txt",sep="\t",header=T)
+iv.R.imp <- read.table(file = "residual_covariances_asreml_bivariate_10trait_6011_records_imputed.txt",sep="\t",header=T)
+corr.imp <- read.table(file = "genetic_correlations_asreml_bivariate_10trait_6011_records_imputed.txt",sep="\t",header = T)
+# genetic correlations
+cor.test(iv.G.imp$Value,iv.G.na$Value)
+corr.diff <- corr.na - corr.imp
+rownames(corr.diff) <- colnames(corr.diff)[-1]
+corr.diff <- corr.diff %>%
+  rownames_to_column(var = "Trait1")
+corr.diff2 <- melt(corr.diff) %>%
+  rename(Trait2 = variable, r = value)
+
+diff_cor <- ggplot(corr.diff2, aes(x = Trait1, y = Trait2, fill = r, label = round(r, 2))) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, limits = c(-1, 1)) +
+  theme_minimal() +
+  labs(
+    x = "",
+    y = "",
+    fill = "Correlation (r)"
+  ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 10, color = "black"), axis.text.y = element_text(size = 10, color = "black"),legend.text = element_text(size = 10)) +
+  geom_text(color = "black", size = 3); diff_cor
+ggsave(filename = "difference_imp_na_correlation_heatmap.png",plot = diff_cor)
+ggsave(filename = "difference_imp_na_correlation_heatmap.pdf",plot = diff_cor)
+print(corr.diff[9,-1])
+cat(sprintf('Average difference in correlations of Adj_Hjd_47 and the other trait: %f (%f)',mean(as.numeric(abs(corr.diff[9,-1]))),sd(abs(corr.diff[9,-1]))))
+# genetic scale parameters and h2
+Vg.imp <- iv.G.imp %>%
+  filter(grepl("Adj_Hjd_47:Adj_Hjd_47", Component))
+Vr.imp <- iv.R.imp %>%
+  filter(grepl("Adj_Hjd_47:Adj_Hjd_47", Component))
+cat(sprintf('h^2 imputed for Hjd_47: %f (%f)'))
+
+```
+
+## ASReml analysis of PCs
+PCs as response, univariate runs.
+```{r}
+####################### analysis using PCs #############################
+## Test different number of PC:s
+# step 0 get new data frame
+# Fix pedigrees
+# Get relevant genotypes in F1
+colnames(pedigreeF264btmp) <- c("Genotype_id","Mum","Dad")
+pedF1 <- pedigreeF264btmp
+filtered_pedF1 <- pedF1 %>%
+  filter(Genotype_id %in% dataF264_norm$Genotype_id)
+dataF264_norm2 <- dataF264_norm %>%
+  filter(Genotype_id %in% as.numeric(pedigreeF264btmp$Genotype_id))
+
+ainv <- ainverse(pedF1)
+
+PCphen <- PC # save old data frame
+PC <- as.data.frame(results$x)
+rownames(PC) <- results$Genotype_id
+PC <- PC %>%
+  rownames_to_column(var = "Genotype_id") %>%
+  filter(Genotype_id %in% as.numeric(pedigreeF264btmp$Genotype_id))
+data.pc <- merge(PC,dataF264_norm2,by="Genotype_id")
+data.pc$Genotype_id <- as.factor(x = data.pc$Genotype_id)
+data.pc$Family <- as.factor(x = data.pc$Family)
+######### check first with a bivariate analysis
+res.PC.bivar<- asreml(
+  fixed = cbind(PC1, PC2) ~ trait,
+  random = ~ us(trait):vm(Genotype_id, ainv),
+  residual = ~ id(units):us(trait),
+  data = data.pc,
+  #sna.action = na.method(x = "include", y = "include"),
+  maxit = 1000
+  )
+cat(sprintf('Variance component estimates:\n'))
+summary(res.PC.bivar)$varcomp
+#### PC1
+res.PC1 <- asreml(
+  fixed = PC1 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC1: %f\n',summary(res.PC1)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC1)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC1)$varcomp['Family','component']+summary(res.PC1)$varcomp['units!units','component'])))
+df1 <- data.frame(Estimate = 0, SE = 0)
+df1[nrow(df1) + 1,] = vpredict(res.PC1, PC1 ~ V1/(V1+V2))
+# BPCA
+res.PC1.b <- asreml(
+  fixed = PC1 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = scores.b
+)
+#### PC2
+res.PC2 <- asreml(
+  fixed = PC2 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC2: %f\n',summary(res.PC2)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC2)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC2)$varcomp['Family','component']+summary(res.PC2)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC2, PC2 ~ V1/(V1+V2))
+# BPCA
+res.PC2.b <- asreml(
+  fixed = PC2 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = scores.b
+)
+#### PC3
+res.PC3 <- asreml(
+  fixed = PC3 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC3: %f\n',summary(res.PC3)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC3)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC3)$varcomp['Family','component']+summary(res.PC3)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC3, PC3 ~ V1/(V1+V2))
+# BPCA
+res.PC3.b <- asreml(
+  fixed = PC3 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = scores.b
+)
+res.PC4 <- asreml(
+  fixed = PC4 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC4: %f\n',summary(res.PC4)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC4)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC4)$varcomp['Family','component']+summary(res.PC4)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC4, PC4 ~ V1/(V1+V2))
+res.PC5 <- asreml(
+  fixed = PC5 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC5: %f\n',summary(res.PC5)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC5)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC5)$varcomp['Family','component']+summary(res.PC5)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC5, PC5 ~ V1/(V1+V2))
+res.PC6 <- asreml(
+  fixed = PC6 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC6: %f\n',summary(res.PC6)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC6)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC6)$varcomp['Family','component']+summary(res.PC6)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC6, PC6 ~ V1/(V1+V2))
+res.PC7 <- asreml(
+  fixed = PC7 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC7: %f\n',summary(res.PC7)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC7)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC7)$varcomp['Family','component']+summary(res.PC7)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC7, PC7 ~ V1/(V1+V2))
+res.PC8 <- asreml(
+  fixed = PC8 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC8: %f\n',summary(res.PC8)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC8)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC8)$varcomp['Family','component']+summary(res.PC8)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC8, PC8 ~ V1/(V1+V2))
+res.PC9 <- asreml(
+  fixed = PC9 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC9: %f\n',summary(res.PC9)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC9)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC9)$varcomp['Family','component']+summary(res.PC9)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC9, PC9 ~ V1/(V1+V2))
+res.PC10 <- asreml(
+  fixed = PC10 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC10: %f\n',summary(res.PC10)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC10)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC10)$varcomp['Family','component']+summary(res.PC10)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC10, PC10 ~ V1/(V1+V2))
+res.PC11 <- asreml(
+  fixed = PC11 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC11: %f\n',summary(res.PC11)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC11)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC11)$varcomp['Family','component']+summary(res.PC11)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC11, PC11 ~ V1/(V1+V2))
+res.PC12 <- asreml(
+  fixed = PC12 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC12: %f\n',summary(res.PC12)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC12)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC12)$varcomp['Family','component']+summary(res.PC12)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC12, PC12 ~ V1/(V1+V2))
+res.PC13 <- asreml(
+  fixed = PC13 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC13: %f\n',summary(res.PC13)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC13)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC13)$varcomp['Family','component']+summary(res.PC13)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC13, PC13 ~ V1/(V1+V2))
+res.PC14 <- asreml(
+  fixed = PC14 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC14: %f\n',summary(res.PC14)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC14)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC14)$varcomp['Family','component']+summary(res.PC14)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC14, PC14 ~ V1/(V1+V2))
+res.PC15 <- asreml(
+  fixed = PC15 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC15: %f\n',summary(res.PC15)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC15)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC15)$varcomp['Family','component']+summary(res.PC15)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC15, PC15 ~ V1/(V1+V2))
+df1 <- df1[-1,]
+print(df1)
+
+##################### Plot h2 ####################
+
+df1 <- df1 %>%
+  rownames_to_column() %>%
+  rename(Component = rowname)
+df1$Order = seq(1,15)
+ppch2 <- ggplot(df1, aes(x = reorder(Component,Order), y = Estimate)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  geom_errorbar(aes(ymin = Estimate - SE, ymax = Estimate + SE), width = 0.2, position = position_dodge(width = 0.9)) +
+  labs(title = "",
+       x = "",
+       y = "Heritability") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(colour = "black",size = 11, angle = 45, hjust = 1),axis.text.y = element_text(colour = "black",size = 11),axis.title = element_text(size = 12)); ppch2
+ggsave(filename = "h2_15PC_15traits_1685trees.pdf", plot = ppch2)
+ggsave(filename = "h2_15PC_15traits_1685trees.png", plot = ppch2)
+########################### Plot of PC vs Phenotype correlation ########################
+# 
+
+nc1 <- ncol(data.pc)-18
+nc2 <- ncol(data.pc)-1
+data.pc.s <- data.pc %>%
+  select(c(PC1,PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,PC10,Adj_Dia_14,Adj_Dia_26,Adj_Dia_47,Adj_Ftopp_47,Adj_Gant_14,Adj_Gdia_26,Adj_Gdiagr130_14,Adj_Gvin_26,Adj_Gvingr130_14,Adj_Hjd_10,Adj_Hjd_14,Adj_Hjd_26,Adj_Hjd_47,Adj_Sprant_14,Adj_Sprant_26))
+cor.mat <- as.data.frame(cor(data.pc.s)) %>%
+  rename_with(~gsub("^Adj_", "", .), starts_with("Adj_"))
+rownames(cor.mat) <- colnames(cor.mat)
+
+lf.cor <- melt(as.matrix(cor.mat))
+lf.cor <- lf.cor %>%
+  filter(Var2 == 'PC1' | Var2 == 'PC2' | Var2 == 'PC3' | Var2 == 'PC4' | Var2 == 'PC5' | Var2 == 'PC6' | Var2 == 'PC7' | Var2 == 'PC8' | Var2 == 'PC9' | Var2 == 'PC10') %>%
+  filter(Var1 != 'PC1' & Var1 != 'PC2' & Var1 != 'PC3' & Var1 != 'PC4' & Var1 != 'PC5' & Var1 != 'PC6' & Var1 != 'PC7' & Var1 != 'PC8' & Var1 != 'PC9' & Var1 != 'PC10') 
+
+pcor <- ggplot(data = lf.cor, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+   name="Pearson\nCorrelation") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    hjust = 1),axis.title = element_blank(),legend.text = element_text(size = 10),legend.title = element_text(size = 10), axis.text = element_text(size = 9))+
+ coord_fixed(); pcor
+
+ggsave(filename = "correlation_10PC_traits.pdf",pcor)
+ggsave(filename = "correlation_10PC_traits.png",pcor)
+# Set direction of PCs based on correlations with traits
+# Check loadings
+# Plot PC1 vs EBV for height and diameter
+# Add the regression line
+pn1 <- ggplot(data.pc, aes(x=Adj_Dia_26, y=PC1,color = 'Hjd_26')) + 
+  geom_point(alpha = 0.3) + 
+  scale_color_manual(values = brewer.pal(3, "Dark2")) +
+  geom_point(aes(x=Adj_Hjd_26, y=PC1,color = 'Dia_26')) + 
+  geom_point(aes(x=Adj_Hjd_10, y=PC1,color = 'Hjd_10')) +
+  theme_minimal() +
+  geom_smooth(method=lm,color="black",se = FALSE) +
+  theme(legend.title = element_text(size=12), #change legend title font size
+        legend.text = element_text(size=11),
+        axis.text=element_text(size=11),
+        axis.title=element_text(size=12)) + #change legend text font size+
+  labs(color = "Trait",size=12) +
+  xlab('Trait'); pn1
+ggsave(filename = "PC1_vs_phenotypes_1685.png", plot = pn1)
+ggsave(filename = "PC1_vs_phenotypes_1685.pdf", plot = pn1)
+```
+
+## Pairwise analyses of PCs
+Failed to estimate correlations between PCs in ASReml.
+```{r}
+res.PC.mvar<- asreml(
+  fixed = cbind(PC1, PC2, PC3, PC4, PC5, PC6, PC7, PC8, PC9, PC10) ~ trait, # only 10 traits possible to analyze in my R environment
+  random = ~ us(trait):vm(Genotype_id, ainv),
+  residual = ~ id(units):us(trait),
+  data = data.pc,
+  aising = TRUE,
+  na.action = na.method(x = "include", y = "include"),
+  maxit = 1000
+  )
+
+summary(res.PC.mvar)$varcomp
+
+res.PC.mvar <- update(res.PC.mvar)
+
+df_lists2 <- data.pc  %>% 
+  select(c(PC1,PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,PC10,PC11,PC12,PC13,PC14,PC15)) %>%
+  summarise_all(list) %>% 
+  pivot_longer(cols = everything(), 
+               names_to = "var", 
+               values_to = "vector") %>% 
+  print()
+
+df_lists_comb2 <- combn(df_lists2$var,2) 
+rownames(df_lists_comb2) <- c("Trait1","Trait2")
+
+
+res.list2 <- list()
+for(i in 1:ncol(df_lists_comb2)){
+  res.list2[[i]] <- bivar(trait1 = df_lists_comb2[1,i], trait2 = df_lists_comb2[2,i], data = data.pc,ainv = ainv)
+}
+##################### Plot pairwise correlations
+# Step 1: make data frame from asreml result object
+
+df_v <- summary(res.PC.mvar)$varcomp
+# store pairwise covariation  
+# G
+df_v_filtered <- df_v %>%
+  rownames_to_column(var = "rowname") %>%
+  filter(grepl("Genotype_id", rowname))
+df_vg <- df_v_filtered %>%
+  mutate(
+    Trait1 = as.numeric(str_extract(rowname, "[0-9]+")), #sub(".*trait_([A-Z0-9]+):.*", "\\1", rowname),
+    Trait2 = as.numeric(str_extract(rowname, "[0-9]+$"))
+  )
+covG <- matrix(0,max(as.numeric(df_vg$Trait1)),max(as.numeric(df_vg$Trait2)))
+colnames(covG) <- rownames(covG) <- paste0("PC",seq(1,10))
+for (i in 1:nrow(df_vg)) {
+    covG[df_vg$Trait1[i], df_vg$Trait2[i]] <- df_vg$component[i]
+    covG[df_vg$Trait2[i], df_vg$Trait1[i]] <- df_vg$component[i] # Assuming the matrix is symmetric
+}
+corG <- cov2cor(covG)
+corGl <- melt(corG) 
+colnames(corGl) <- c("Trait1","Trait2","Correlation")
+corGl <- corGl %>%
+  mutate(Trait1 = as.factor(Trait1)) %>%
+  mutate(Trait2 = as.factor(Trait2))
+# R
+df_v_filtered <- df_v %>%
+  rownames_to_column(var = "rowname") %>%
+  filter(!grepl("Genotype_id", rowname)) %>%
+  filter(!grepl("R", rowname))
+df_vr <- df_v_filtered %>%
+  mutate(
+    Trait1 = as.numeric(str_extract(rowname, "[0-9]+")), #sub(".*trait_([A-Z0-9]+):.*", "\\1", rowname),
+    Trait2 = as.numeric(str_extract(rowname, "[0-9]+$"))
+  )
+covR <- matrix(0,max(as.numeric(df_vr$Trait1)),max(as.numeric(df_vr$Trait2)))
+colnames(covR) <- rownames(covR) <- paste0("PC",seq(1,10))
+for (i in 1:nrow(df_vr)) {
+    covR[df_vr$Trait1[i], df_vr$Trait2[i]] <- df_vr$component[i]
+    covR[df_vr$Trait2[i], df_vr$Trait1[i]] <- df_vr$component[i] # Assuming the matrix is symmetric
+}
+corR <- cov2cor(covR)
+corRl <- melt(corR) 
+colnames(corRl) <- c("Trait1","Trait2","Correlation")
+corRl <- corRl %>%
+  mutate(Trait1 = as.factor(Trait1)) %>%
+  mutate(Trait2 = as.factor(Trait2))
+# Step 2: plot using 
+pcorpc <- ggplot(data = corGl, aes(Trait2, Trait1, fill = Correlation))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+   name="Correlation") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    hjust = 1),axis.title = element_blank(),legend.text = element_text(size = 10),legend.title = element_text(size = 10), axis.text = element_text(size = 9))+
+ coord_fixed(); pcorpc
+pcorpc2 <- ggplot(data = corRl, aes(Trait2, Trait1, fill = Correlation))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+   name="Correlation") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    hjust = 1),axis.title = element_blank(),legend.text = element_text(size = 10),legend.title = element_text(size = 10), axis.text = element_text(size = 9),legend.position = "none")+
+ coord_fixed(); pcorpc2
+pcorpc3 <- plot_grid(pcorpc,pcorpc2,
+          ncol = 2,
+          labels = c("A","B"),
+          rel_widths = c(1.3, 1.1),
+          rel_heights = c(1.0,1.0)); pcorpc3
+ggsave(filename = "correlation_10PC_traits_mv.pdf",pcorpc3,dpi = 300,height = 10,width = 10)
+ggsave(filename = "correlation_10PC_traits_mv.png",pcorpc3,dpi = 300,height = 10,width = 10)
+
+####### check correlation between residual and genetic covariances 
+mantel(corG,corR)
+```
+## ASReml analysis of PCs for alternative pedigree
+PCs as response 10 trait data set.
+```{r}
+####################### analysis using PCs #############################
+## Test different number of PC:s
+# step 0 get new data frame
+PCphen <- PC <- scores.b6044 # save old data frame
+rownames(PC) <- dataF264_norm.ny[,"Genotype_id"]
+# Fix pedigrees
+# Get relevant genotypes in F1
+pedF1 <- pedigreeF264[271:nrow(pedigreeF264),1:3]
+filtered_pedF1 <- pedF1 %>%
+  filter(Genotype_id %in% dataF264_norm.ny[,"Genotype_id"])
+dataF264_norm.ny2 <- dataF264_norm.ny %>%
+  as.data.frame() %>%
+  filter(Genotype_id %in% as.numeric(filtered_pedF1$Genotype_id))
+
+ainv <- ainverse(tmpped)
+
+PC <- PC %>%
+  rownames_to_column(var = "Genotype_id") %>%
+  filter(Genotype_id %in% as.numeric(filtered_pedF1$Genotype_id))
+
+data.pc <- merge(PC,dataF264_norm.ny2,by=c("Genotype_id"))
+data.pc$Genotype_id <- as.factor(x = data.pc$Genotype_id)
+data.pc$Family_id <- as.factor(x = data.pc$Family_id)
+res.PC.bivar<- asreml(,
+  fixed = cbind(PC1, PC2) ~ trait,
+  random = ~ us(trait):vm(Genotype_id, ainv),
+  residual = ~ id(units):us(trait),
+  data = data.pc,
+  sna.action = na.method(x = "include", y = "include"),
+  maxit = 1000
+  )
+cat(sprintf('Variance component estimates:\n'))
+summary(res.PC.bivar)$varcomp
+#### PC1
+res.PC1 <- asreml(
+  fixed = PC1 ~ 1, 
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC1: %f\n',summary(res.PC1)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC1)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC1)$varcomp['Family','component']+summary(res.PC1)$varcomp['units!units','component'])))
+df1 <- data.frame(Estimate = 0, SE = 0)
+df1[nrow(df1) + 1,] = vpredict(res.PC1, PC1 ~ V2/(V1+V2))
+# SVD PCA
+res.PC1.s <- asreml(
+  fixed = PC1 ~ 1, 
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = PC.imp
+)
+#### PC2
+res.PC2 <- asreml(
+  fixed = PC2 ~ 1,
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC2: %f\n',summary(res.PC2)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC2)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC2)$varcomp['Family','component']+summary(res.PC2)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC2, PC2 ~ V2/(V1+V2))
+# SVD PCA
+res.PC2.s <- asreml(
+  fixed = PC2 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = PC.imp
+)
+#### PC3
+res.PC3 <- asreml(
+  fixed = PC3 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC3: %f\n',summary(res.PC3)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC3)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC3)$varcomp['Family','component']+summary(res.PC3)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC3, PC3 ~ V2/(V1+V2))
+# SVD PCA
+res.PC3.s <- asreml(
+  fixed = PC3 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = PC.imp
+)
+res.PC4 <- asreml(
+  fixed = PC4 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC4: %f\n',summary(res.PC4)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC4)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC4)$varcomp['Family','component']+summary(res.PC4)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC4, PC4 ~ V2/(V1+V2))
+res.PC5 <- asreml(
+  fixed = PC5 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC5: %f\n',summary(res.PC5)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC5)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC5)$varcomp['Family','component']+summary(res.PC5)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC5, PC5 ~ V2/(V1+V2))
+res.PC6 <- asreml(
+  fixed = PC6 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC6: %f\n',summary(res.PC6)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC6)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC6)$varcomp['Family','component']+summary(res.PC6)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC6, PC6 ~ V2/(V1+V2))
+res.PC7 <- asreml(
+  fixed = PC7 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC7: %f\n',summary(res.PC7)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC7)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC7)$varcomp['Family','component']+summary(res.PC7)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC7, PC7 ~ V2/(V1+V2))
+res.PC8 <- asreml(
+  fixed = PC8 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC8: %f\n',summary(res.PC8)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC8)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC8)$varcomp['Family','component']+summary(res.PC8)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC8, PC8 ~ V2/(V1+V2))
+res.PC9 <- asreml(
+  fixed = PC9 ~ 1, # df.pc$PC[1]
+  random = ~vm(Genotype_id, ainv),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC9: %f\n',summary(res.PC9)$varcomp['vm(Genotype_id, ainv)','component']/(summary(res.PC9)$varcomp['vm(Genotype_id, ainv)','component']+summary(res.PC9)$varcomp['Family','component']+summary(res.PC9)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC9, PC9 ~ V2/(V1+V2))
+df1<-df1[-1,]
+##################### Plot h2 ####################
+
+df1 <- df1 %>%
+  rownames_to_column() %>%
+  rename(Component = rowname)
+df1$Order = seq(1,9)
+ph2 <- ggplot(df1, aes(x = reorder(Component,Order), y = Estimate)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  geom_errorbar(aes(ymin = Estimate - SE, ymax = Estimate + SE), width = 0.2, position = position_dodge(width = 0.9)) +
+  labs(title = "",
+       x = "Heritability",
+       y = "Estimate") +
+  theme_classic() +
+  theme(axis.text.x = element_text(colour = "black",size = 10, angle = 90, hjust = 1),axis.text.y = element_text(colour = "black",size = 10)); ph2
+ggsave(filename = "Figures/h2_9PC_traits_10traits_6011trees.pdf",ph2)
+ggsave(filename = "Figures/h2_9PC_traits_10traits_6011trees.png",ph2)
+########################### Plot of PC vs Phenotype correlation ########################
+# 
+
+nc1 <- ncol(data.pc)-18
+nc2 <- ncol(data.pc)-1
+data.pc.s <- data.pc %>%
+  select(c(PC1,PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,Adj_Dia_26,Adj_Dia_47,Adj_Ftopp_47,Adj_Gdia_26,Adj_Gvin_26,Adj_Hjd_10,Adj_Hjd_14,Adj_Hjd_26,Adj_Hjd_47,Adj_Sprant_26))
+cor.mat <- as.data.frame(cor(data.pc.s,use = "na.or.complete"))
+rownames(cor.mat) <- colnames(cor.mat)
+
+lf.cor <- melt(as.matrix(cor.mat))
+lf.cor <- lf.cor %>%
+  filter(Var2 == 'PC1' | Var2 == 'PC2' | Var2 == 'PC3' | Var2 == 'PC4' | Var2 == 'PC5' | Var2 == 'PC6' | Var2 == 'PC7' | Var2 == 'PC8' | Var2 == 'PC9') %>%
+  filter(Var1 != 'PC1' & Var1 != 'PC2' & Var1 != 'PC3' & Var1 != 'PC4' & Var1 != 'PC5' & Var1 != 'PC6' & Var1 != 'PC7' & Var1 != 'PC8' & Var1 != 'PC9') 
+
+
+pcor <- ggplot(data = lf.cor, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+   name="Pearson\nCorrelation") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    hjust = 1),axis.title = element_blank(),legend.text = element_text(size = 13),legend.title = element_text(size = 14))+
+ coord_fixed(); pcor
+
+ggsave(filename = "correlation_9PC_traits_10traits_6011trees.pdf",pcor)
+ggsave(filename = "correlation_9PC_traits_10traits_6011trees.png",pcor)
+# Set direction of PCs based on correlations with traits
+# Check loadings
+
+# Plot PC1 vs EBV for height and diameter
+# Add the regression line
+pn1 <- ggplot(data.pc, aes(x=PC1)) + 
+  geom_point(aes(y=Adj_Dia_14, color = 'Dia_14')) + 
+  geom_point(aes(y=Adj_Dia_26, color = 'Dia_26')) + 
+  geom_point(aes(y=Adj_Hjd_14, color = 'Hjd_14')) +
+  geom_smooth(aes(y = Adj_Dia_14, color = "Dia_14"), method = "lm", se = FALSE, linetype = "dashed") +
+  geom_smooth(aes(y = Adj_Dia_26, color = "Dia_26"), method = "lm", se = FALSE, linetype = "dotted") +
+  geom_smooth(aes(y = Adj_Hjd_14, color = "Hjd_14"), method = "lm", se = FALSE, linetype = "solid") +
+  scale_color_manual(values = c("#E69F00", "#56B4E9", "#009E73"), 
+                     labels = c("Dia_14", "Dia_26", "Hjd_14")) +
+  labs(x = "PC1", y = "Measurement", color = "Trait") +
+  theme_minimal() +
+  theme(legend.title = element_text(size=14), #change legend title font size
+        legend.text = element_text(size=10),
+        axis.text=element_text(size=12),
+        axis.title=element_text(size=14)); pn1
+
+ggsave(filename = "Trait_PC_correlation.png",plot = pn1)
+ggsave(filename = "Trait_PC_correlation.pdf",plot = pn1)
+```
+
+
+## Comparing differences in EBV rank lists between PC and standard approach 
+We used two alternative selection indices with equal weight at age 26 (i.e. final evaluation of the trial in north of Sweden): <br>
+* only production (height + diameter)
+* production and tree stem quality (height + diameter + branch angle - branch diameter)
+In Isik and McKeand (2019), they used a selection index of 0.6 volume, 0.2 stem straightness and -0.2 for fusiform rust.<br>
+Comparison (of EBV rank lists) are made using Kendall's tau.
+```{r}
+# selection index
+# Step 1: Extract EBV
+############
+reorder_rank <- function(ind.rank){
+  # column 1 is the classic procedure
+  # column 2 is the PC approach 
+  nr <- nrow(ind.rank)
+  ind.rank.n <- matrix(0,nr,1)
+  for (i in 1:nr){
+    nr1 <- ind.rank[i,1]
+    ind.rank.n[which(ind.rank[,2]==nr1)]<- i
+  }
+  return(ind.rank.n)
+}
+fix_asreml_object <- function(final.res){
+  
+  df <- as_tibble(final.res$coefficients$random)
+  df$TraitTMP <- rownames(final.res$coefficients$random)
+  df$SE <- sqrt(final.res$vcoeff$random * final.res$sigma2)
+  # Removes the rows in Data frame
+  # which consist "Family" in the TraitTMP column and then remove the column
+  df <- df[!grepl("Family",df$TraitTMP),]
+  # Fix trait name
+
+  tmp <- unlist(strsplit(x = df$TraitTMP,split = ':'))
+  row_odd <- seq_len(length(tmp)) %% 2  # Create row indicator
+  tmp2 <- unlist(strsplit(x = tmp[row_odd==0],split=')_'))
+  tmp2 <- tmp2[row_odd==0]
+  tmp <- tmp[seq(1,length(tmp),2)]
+  df$Trait <-gsub('trait_', '', tmp)
+  df$Individual <- tmp2
+
+  df <- select(df,-TraitTMP)
+  colnames(df)[1] <- "EBV"
+
+  return(as.data.frame(df))
+}
+fix_asreml_object_PC <- function(res.PC){
+  
+  df.PC <- as.data.frame(res.PC$coefficients$random)
+  df.PC$SE <- sqrt(res.PC$vcoeff$random * res.PC$sigma2)
+  df.PC <- df.PC[!grepl("Family",rownames(df.PC)),]
+  df.PC$Individual <- substr(x = rownames(df.PC),start=23,stop=nchar(rownames(df.PC)))
+  colnames(df.PC)[1] <- "EBV"  
+  
+  return(df.PC)
+}
+
+fix_df <- function(df.PC,common_ids){
+  
+  df.PCn <- df.PC %>%
+  filter(Individual %in% common_ids) %>%
+  slice(match(common_ids, Individual)) %>%
+  filter(EBV != 0.0)
+  
+  return(df.PCn)
+}
+final.res <- readRDS(file = "Save/run_asreml_final_model_BLUP.RData")
+df.ref <- fix_asreml_object(final.res)
+df.PC1 <- fix_asreml_object_PC(res.PC1)
+df.PC2 <- fix_asreml_object_PC(res.PC2)
+df.PC3 <- fix_asreml_object_PC(res.PC3)
+df.PC1.b <- fix_asreml_object_PC(res.PC1.b)
+df.PC2.b <- fix_asreml_object_PC(res.PC2.b)
+df.PC3.b <- fix_asreml_object_PC(res.PC3.b)
+df.PC4 <- fix_asreml_object_PC(res.PC4)
+df.PC5 <- fix_asreml_object_PC(res.PC5)
+df.PC6 <- fix_asreml_object_PC(res.PC6)
+df.PC7 <- fix_asreml_object_PC(res.PC7)
+df.PC8 <- fix_asreml_object_PC(res.PC8)
+df.PC9 <- fix_asreml_object_PC(res.PC9)
+df.PC10 <- fix_asreml_object_PC(res.PC10)
+df.PC11 <- fix_asreml_object_PC(res.PC11)
+df.PC12 <- fix_asreml_object_PC(res.PC12)
+df.PC13 <- fix_asreml_object_PC(res.PC13)
+df.PC14 <- fix_asreml_object_PC(res.PC14)
+df.PC15 <- fix_asreml_object_PC(res.PC15)
+df.PC1.1685 <- df.PC1
+df.PC2.1685 <- df.PC2
+df.PC3.1685 <- df.PC3
+# Step 1.5: align df:s
+df1 <- df.ref[df.ref$Trait=='Adj_Hjd_26',]
+df2 <- df.ref[df.ref$Trait=='Adj_Dia_26',]
+df3 <- df.ref[df.ref$Trait=='Adj_Gdia_26',]
+df4 <- df.ref[df.ref$Trait=='Adj_Gvin_26',]
+common_ids <- intersect(df1$Individual, df.PC1$Individual)
+df1 <- df1 %>% filter(Individual %in% common_ids) %>% filter(EBV != 0.0)
+df2 <- df2 %>% filter(Individual %in% common_ids) %>% filter(EBV != 0.0)
+df3 <- df3 %>% filter(Individual %in% common_ids) %>% filter(EBV != 0.0)
+df4 <- df4 %>% filter(Individual %in% common_ids) %>% filter(EBV != 0.0)
+df.PC1 <- fix_df(df.PC = df.PC1,common_ids) 
+df.PC2 <- fix_df(df.PC = df.PC2,common_ids)
+df.PC3 <- fix_df(df.PC = df.PC3,common_ids)
+df.PC4 <- fix_df(df.PC = df.PC4,common_ids)
+df.PC5 <- fix_df(df.PC = df.PC5,common_ids)
+df.PC6 <- fix_df(df.PC = df.PC6,common_ids)
+df.PC7 <- fix_df(df.PC = df.PC7,common_ids)
+df.PC8 <- fix_df(df.PC = df.PC8,common_ids)
+df.PC9 <- fix_df(df.PC = df.PC9,common_ids)
+df.PC10 <- fix_df(df.PC = df.PC10,common_ids)
+df.PC11 <- fix_df(df.PC = df.PC11,common_ids)
+df.PC12 <- fix_df(df.PC = df.PC12,common_ids)
+df.PC13 <- fix_df(df.PC = df.PC13,common_ids)
+df.PC14 <- fix_df(df.PC = df.PC14,common_ids)
+df.PC15 <- fix_df(df.PC = df.PC15,common_ids)
+# Step 2: calculate index for production (here volume), with 50% height and 50% diameter
+tmp1 <- 0.5*(df1[,'EBV'] + df2[,'EBV'])
+selindex <- data_frame(PC1 =df.PC1$EBV,PC2 =df.PC2$EBV,PC3 =df.PC3$EBV,PC4 =df.PC4$EBV,PC5 =df.PC5$EBV,PC6 =df.PC6$EBV,PC7 =df.PC7$EBV,PC8 =df.PC8$EBV,PC9 =df.PC9$EBV,PC10 =df.PC10$EBV,PC11 =df.PC11$EBV,PC12 =df.PC12$EBV,PC13 =df.PC13$EBV,PC14 =df.PC14$EBV,PC15 =df.PC15$EBV,ProdIndex = tmp1, QualIndex = 0.5*tmp1 + 0.5*(df4[,'EBV'] - df3[,'EBV']), Individual = df1[,'Individual'])
+
+######## Create selection index of PCs ##########
+############################## Backtransform
+### df with EBVs for each tree
+data.pc.b <- selindex %>%
+  select(c(PC1,PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,PC10,PC11,PC12,PC13,PC14,PC15)) %>%
+  as.matrix()
+rotation <- as.matrix(results$rotation)
+mu <- colMeans(dataF264_norm[,3:17])
+EBV.pc <- as.data.frame(data.pc.b %*% t(rotation) + mu)
+EBV.pc$Genotype_id <- selindex$Individual
+#### update selindex
+selindex <- selindex %>% 
+  mutate(PCprod = 0.5*(EBV.pc[,"Hjd_26"] + EBV.pc[,"Dia_26"])) %>% # production
+  mutate(PCqual = 0.5*PCprod + 0.25*EBV.pc[,"Gvin_26"] - 0.25*EBV.pc[,"Gdia_26"]) # Adj_
+
+# Order EBVs
+ind1 <- order(selindex$QualIndex,decreasing = TRUE) # Traditional
+ind2 <- order(selindex$PCqual,decreasing = TRUE) # PCA first PC, reverse order
+ind.rank.q <- data.frame(ClassicRankQuality = ind1,PCRankQuality = ind2)
+print(ind.rank.q[1:25,])
+
+
+## Production selection index
+# Order EBVs
+ind1 <- order(selindex$ProdIndex,decreasing = TRUE) # Traditional
+ind2 <- order(selindex$PCprod,decreasing = TRUE) # PCA first PC, reverse order
+ind.rank.p <- data.frame(ClassicRankProduction = ind1,PCRankProduction = ind2)
+print(ind.rank.p[1:25,])
+
+# Plot selection coefficients to form PC based index
+# using rotations for each selection index
+sel.index <- data.frame(Quality = 0.25*(rotation["Hjd_26",] + rotation["Dia_26",] + rotation["Gvin_26",] - rotation["Gdia_26",]), Production = 0.5*(rotation["Hjd_26",] + rotation["Dia_26",])) # Adj_
+rownames(sel.index) <- colnames(selindex)[1:15]
+                                  
+df <- as.data.frame(colnames(selindex)[1:15])
+sel.index$PC <- factor(df$`colnames(selindex)[1:15]`,levels = c("PC1", "PC2", "PC3", "PC4", "PC5", "PC6", "PC7", "PC8", "PC9", "PC10", "PC11", "PC12", "PC13", "PC14", "PC15")) # Change ordering manually
+              
+sel.index.long <- melt(sel.index) %>%
+  rename(SelectionIndex = variable, EffectSize = value)
+ppc <- ggplot(sel.index.long,aes(x = PC, y = EffectSize,fill = SelectionIndex)) +
+geom_bar(stat="identity", color="black", position=position_dodge())+
+  theme_minimal() + 
+    # Set fill colors using scale_fill_manual
+  scale_fill_manual(values = cluster_colors[c(2,1)]) +
+  labs(fill = "Selection index") +
+  ylab("Proportion") +
+  theme(axis.title = element_text(size = 12), axis.text.y = element_text(size = 11, color = "black"),axis.title.x = element_blank(),legend.text = element_text(size = 11),legend.position="top",axis.text.x = element_text(size = 10, angle = 45, vjust = 0.5, hjust=1)); ppc
+ggsave(filename = "selected_PC.png",plot = ppc)
+ggsave(filename = "selected_PC.pdf",plot = ppc)
+########### rank plot ############
+rank2 <- reorder_rank(ind.rank.p)
+rank3 <- reorder_rank(ind.rank.q)
+ind.rank <- data.frame(Production = rank2,Quality = rank3,Reference = seq(1,length(rank2)))
+ind.rank.long <- melt(ind.rank,id.vars=c("Reference")) %>%
+  rename(Rank = value,SelectionIndex = variable)
+fp <- ggplot(ind.rank.long, aes(x=Reference, y=Rank, color=SelectionIndex)) +
+  geom_point(alpha = 0.3,show.legend = FALSE) + 
+  theme(legend.position = "none",axis.title.x = element_blank(),axis.title.y = element_blank(),axis.text.x = element_text(size=11,color = "black"),axis.text.y = element_text(size=11,color = "black"),legend.text = element_text(size = 11)) + 
+  geom_abline(intercept = 0, slope = 1, color = "black", size = 1) + 
+  scale_color_manual(values = cluster_colors) +  # Apply the color palette
+   labs(color = "Selection index") +
+  xlab("Rank") +
+  theme_minimal(); fp
+ggsave(filename = "Figures/rank_plot_all_ind.png",plot = fp,dpi = 300)
+ggsave(filename = "Figures/rank_plot_all_ind.pdf",plot = fp)
+# Zoom in on top 50
+ind.rank.long.50 <- ind.rank.long %>%
+  filter(Reference <= 50)
+fpz <- ggplot(ind.rank.long.50, aes(x=Reference, y=Rank, color=SelectionIndex)) +
+  geom_point(alpha = 0.5,show.legend = FALSE) + 
+  theme(legend.position = element_blank(), axis.title.x = element_blank(),axis.title.y = element_blank(),axis.text.x = element_text(size=11,color = "black"),axis.text.y = element_text(size=11,color = "black"),legend.text = element_text(size = 11)) + 
+  geom_abline(intercept = 0, slope = 1, color = "black", size = 1) + 
+  scale_color_manual(values = cluster_colors) +  # Apply the color palette
+  labs(color = "Selection index") +
+  xlab("Rank") +
+  theme_minimal(); fpz
+ggsave(filename = "rank_plot_50_ind.png",plot = fpz)
+ggsave(filename = "rank_plot_50_ind.pdf",plot = fpz)
+ind.rank.long.50.prod <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "Production")
+ind.rank.long.50.qual <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "Quality")
+corr_prod <- cor.test(ind.rank.long.50.prod$Rank, ind.rank.long.50.prod$Reference, method = "kendall"); corr_prod
+corr_qual <- cor.test(ind.rank.long.50.qual$Rank, ind.rank.long.50.qual$Reference, method = "kendall"); corr_qual
+cat(sprintf("Number of trees selected with PCA but not with the standard method based on production top 50 rank: %d\n",length(which(ind.rank.long.50.prod$Rank > 50))))
+cat(sprintf("Number of trees selected with PCA but not with the standard method based on quality top 50 rank: %d\n",length(which(ind.rank.long.50.qual$Rank > 50))))
+selindex <- selindex %>%
+  mutate(PCqual_stand = scale(PCqual),
+         PCprod_stand = scale(PCprod),
+         Production_stand = scale(ProdIndex),
+         Quality_stand = scale(QualIndex))
+PCqual_stand <- selindex$PCqual_stand %>%
+  sort(.,decreasing = TRUE)
+PCprod_stand <- selindex$PCprod_stand %>%
+  sort(.,decreasing = TRUE)
+Prod_stand <- selindex$Production_stand %>%
+  sort(.,decreasing = TRUE)
+Qual_stand <- selindex$Quality_stand %>%
+  sort(.,decreasing = TRUE)
+cat(sprintf('Average genetic merit of top 50 trees for quality, PCA appoach: %f\n',mean(PCqual_stand[1:50])))
+cat(sprintf('Average genetic merit of top 50 trees for production, PCA appoach: %f\n',mean(PCprod_stand[1:50])))
+cat(sprintf('Average genetic merit of top 50 trees for quality, trad appoach: %f\n',mean(Qual_stand[1:50])))
+cat(sprintf('Average genetic merit of top 50 trees for production, trad appoach: %f\n',mean(Prod_stand[1:50])))
+```
+
+## Selection index for n = 6011, 10 traits, 9 PC
+
+```{r}
+# selection index
+# Step 1: Extract EBV
+############
+
+df.ref <- fix_asreml_object(final.res)
+df.PC1 <- fix_asreml_object_PC(res.PC1)
+df.PC2 <- fix_asreml_object_PC(res.PC2)
+df.PC3 <- fix_asreml_object_PC(res.PC3)
+df.PC1.s <- fix_asreml_object_PC(res.PC1.s)
+df.PC2.s <- fix_asreml_object_PC(res.PC2.s)
+df.PC3.s <- fix_asreml_object_PC(res.PC3.s)
+df.PC4 <- fix_asreml_object_PC(res.PC4)
+df.PC5 <- fix_asreml_object_PC(res.PC5)
+df.PC6 <- fix_asreml_object_PC(res.PC6)
+df.PC7 <- fix_asreml_object_PC(res.PC7)
+df.PC8 <- fix_asreml_object_PC(res.PC8)
+df.PC9 <- fix_asreml_object_PC(res.PC9)
+df.PC1.imp <- df.PC1
+df.PC2.imp <- df.PC2
+df.PC3.imp <- df.PC3
+# Step 2: calculate index for production (here volume), with 50% height and 50% diameter
+tmp1 <- 0.5*(df.ref[df.ref$Trait=='Adj_Hjd_26','EBV'] + df.ref[df.ref$Trait=='Adj_Dia_26','EBV'])
+selindex <- data_frame(PC1 =df.PC1$EBV,PC2 =df.PC2$EBV,PC3 =df.PC3$EBV,PC4 =df.PC4$EBV,PC5 =df.PC5$EBV,PC6 =df.PC6$EBV,PC7 =df.PC7$EBV,PC8 =df.PC8$EBV,PC9 =df.PC9$EBV,ProdIndex = tmp1, QualIndex = 0.5*tmp1 + 0.5*(df.ref[df.ref$Trait=='Adj_Gvin_26','EBV'] - df.ref[df.ref$Trait=='Adj_Gdia_26','EBV']), Individual = df.ref[df.ref$Trait=='Adj_Hjd_26','Individual'])
+# Order EBVs
+ind1 <- order(selindex$ProdIndex,decreasing = TRUE) # Traditional
+ind2 <- order(selindex$PC1) # PCA first PC, reverse order
+# Using cor.test() method 
+res = cor.test(ind1[1:25], ind2[1:25], method = "kendall"); res
+######## Create selection index of PCs ##########
+
+########### random forest ################
+var.predict<-paste(names(selindex)[1:9],collapse="+")
+rf.form <- as.formula(paste("QualIndex", var.predict, sep = " ~ "))
+
+print(rf.form)
+#This is our current itteration of the formula we're using in RF
+
+qual.rf<-randomForest(rf.form,data=selindex,importance=TRUE,ntree=100)
+
+varImpPlot(qual.rf,main = "Quality and production index using Random Forest")
+png("Figures/RandomForest_var_importance_quality_score_n6011_10tr_9PC.png")
+varImpPlot(qual.rf,main = "Quality and production index using Random Forest")
+dev.off()
+#Examine our Variable importance plot
+
+# Print regression model
+print(qual.rf)
+
+# Plot the error vs the number of trees graph
+plot(qual.rf)
+
+imp.nox1 <- as.data.frame(sort(importance(qual.rf)[,1],decreasing = TRUE),optional = T)
+names(imp.nox1) <- "% Inc MSE"
+imp.nox1
+# Production index
+rf.form <- as.formula(paste("ProdIndex", var.predict, sep = " ~ "))
+
+print(rf.form)
+#This is our current itteration of the formula we're using in RF
+
+prod.rf<-randomForest(rf.form,data=selindex,importance=TRUE,ntree=100)
+
+varImpPlot(prod.rf,main = "Production index using Random Forest")
+png("Figures/RandomForest_var_importance_production_score_n6011_10tr_9PC.png")
+varImpPlot(prod.rf,main = "Quality and production index using Random Forest")
+dev.off()
+#Examine our Variable importance plot
+
+# Print regression model
+print(prod.rf)
+
+# Plot the error vs the number of trees graph
+plot(prod.rf)
+
+imp.nox1 <- as.data.frame(sort(importance(prod.rf)[,1],decreasing = TRUE),optional = T)
+names(imp.nox1) <- "% Inc MSE"
+imp.nox1
+############### lasso/elastic net/ridge regression ################
+# Quality index first
+X <- as.matrix(selindex[,1:9])
+Y <- unlist(selindex[,"QualIndex"])
+dim(X)
+# Fit models:
+fit.lasso <- glmnet(x = X, y = Y, family="gaussian", alpha=1)
+fit.ridge <- glmnet(x = X, y = Y, family="gaussian", alpha=0)
+fit.elnet <- glmnet(x = X, y = Y, family="gaussian", alpha=.5)
+print(fit.lasso)
+print(fit.ridge)
+print(fit.elnet)
+plot(fit.lasso)
+plot(fit.ridge)
+plot(fit.elnet)
+# 10-fold Cross validation for each alpha = 0, 0.1, ... , 0.9, 1.0
+fit.lasso.cv <- cv.glmnet(x = X, y = Y, type.measure="mse", alpha=1, 
+                          family="gaussian")
+fit.ridge.cv <- cv.glmnet(x = X, y = Y, type.measure="mse", alpha=0,
+                          family="gaussian")
+fit.elnet.cv <- cv.glmnet(x = X, y = Y, type.measure="mse", alpha=.5,
+                          family="gaussian")
+print(fit.lasso.cv)
+print(fit.ridge.cv)
+print(fit.elnet.cv)
+coef(fit.lasso.cv, s = "lambda.min")
+coef(fit.ridge.cv, s = "lambda.min")
+coef(fit.elnet.cv, s = "lambda.min")
+for (i in 0:10) {
+  assign(paste("fit", i, sep=""), cv.glmnet(x = X, y = Y, type.measure="mse", 
+                                            alpha=i/10,family="gaussian"))
+}
+
+# Plot solution paths:
+par(mfrow=c(3,2))
+# For plotting options, type '?plot.glmnet' in R console
+plot(fit.lasso, xvar="lambda")
+plot(fit10, main="LASSO")
+
+plot(fit.ridge, xvar="lambda")
+plot(fit0, main="Ridge")
+
+plot(fit.elnet, xvar="lambda")
+plot(fit5, main="Elastic Net")
+
+# use the 5 first PCs
+# test lambda = 0.15, elastic net
+coef(fit.lasso.cv, s = 0.15)
+coef(fit.ridge.cv, s = 0.15)
+coef(fit.elnet.cv, s = 0.15)
+
+sel.coef.1 <- as.matrix(unlist(coef(fit.elnet.cv, s = 0.15)))[-1]
+selindex$PCqual <- as.vector(sel.coef.1 %*% t(as.matrix(selindex[,1:9])))
+# Order EBVs
+ind1 <- order(selindex$QualIndex,decreasing = TRUE) # Traditional
+ind2 <- order(selindex$PCqual,decreasing = TRUE) # PCA first PC, reverse order
+ind.rank.q <- data.frame(ClassicRankQuality = ind1,PCRankQuality = ind2)
+print(ind.rank.q[1:25,])
+# Using cor.test() method 
+res = cor.test(ind1[1:25], ind2[1:25], method = "kendall"); res  # Rank
+res2 = cor.test(selindex$QualIndex,selindex$PCqual); res2 # EBV
+
+# Production
+Y <- unlist(selindex[,"ProdIndex"])
+fit.elnet.cv.r <- cv.glmnet(x = X, y = Y, type.measure="mse", alpha=.5,
+                          family="gaussian")
+coef(fit.elnet.cv.r, s = 0.15) # First two components
+
+sel.coef.3 <- as.matrix(unlist(coef(fit.elnet.cv.r, s = 0.15)))[-1]
+selindex$PCprod <- as.vector(sel.coef.3 %*% t(as.matrix(selindex[,1:9])))
+# Order EBVs
+ind1 <- order(selindex$ProdIndex,decreasing = TRUE) # Traditional
+ind2 <- order(selindex$PCprod,decreasing = TRUE) # PCA first PC, reverse order
+ind.rank.p <- data.frame(ClassicRankProduction = ind1,PCRankProduction = ind2)
+print(ind.rank.p[1:25,])
+# Using cor.test() method 
+res = cor.test(ind1[1:10], ind2[1:10], method = "kendall"); res # Rank
+res2 = cor.test(selindex$ProdIndex,selindex$PCprod); res2 # EBV
+# Plot selection coefficients to form PC based index
+sel.index <- data.frame(Quality = sel.coef.1, Production = sel.coef.3)
+rownames(sel.index) <- colnames(selindex)[1:9]
+                                  
+
+df <- as.data.frame(colnames(selindex)[1:9])
+sel.index$PC <- factor(df$`colnames(selindex)[1:9]`,levels = c("PC1", "PC2", "PC3", "PC4", "PC5", "PC6", "PC7", "PC8", "PC9")) # Change ordering manually
+              
+sel.index.long <- melt(sel.index) %>%
+  rename(SelectionIndex = variable, EffectSize = value)
+ppc <- ggplot(sel.index.long,aes(x = PC, y = EffectSize,fill = SelectionIndex)) +
+geom_bar(stat="identity", color="black", position=position_dodge())+
+  theme_minimal() + 
+  scale_color_manual(values = cluster_colors) +
+  theme(axis.text.y = element_text(size = 12, color = "black"),axis.title.x = element_blank(),legend.text = element_text(size = 10),legend.position="top",axis.text.x = element_text(size = 12, angle = 90, vjust = 0.5, hjust=1)); ppc
+ggsave(filename = "Figures/selected_PC_n6011_10tr_9PC.png",plot = ppc)
+ggsave(filename = "Figures/selected_PC_n6011_10tr_9PC.pdf",plot = ppc)
+########### rank plot ############
+#rank1 <- reorder_rank(ind.rank.d)
+rank2 <- reorder_rank(ind.rank.p)
+rank3 <- reorder_rank(ind.rank.q)
+ind.rank <- data.frame(Production = rank2,Quality = rank3,Reference = seq(1,length(rank2)))
+ind.rank.long <- melt(ind.rank,id.vars=c("Reference")) %>%
+  rename(Rank = value,SelectionIndex = variable)
+fp <- ggplot(ind.rank.long, aes(x=Reference, y=Rank, shape=SelectionIndex, color=SelectionIndex)) +
+  geom_point() + 
+  theme(axis.title.x = element_blank(),axis.title.y = element_blank(),axis.text.x = element_text(size=12,color = "black"),axis.text.y = element_text(size=12,color = "black"),legend.text = element_text(size = 10)) + 
+  geom_abline(intercept = 0, slope = 1, color = "black", size = 1) + 
+  scale_color_manual(values = cluster_colors) +
+  theme_minimal(); fp
+ggsave(filename = "Figures/rank_plot_all_ind_n6011_10tr_9PC.png",plot = fp,dpi = 300)
+ggsave(filename = "Figures/rank_plot_all_ind_n6011_10tr_9PC.pdf",plot = fp)
+# Zoom in on top 50
+ind.rank.long.50 <- ind.rank.long %>%
+  filter(Reference <= 50)
+fpz <- ggplot(ind.rank.long.50, aes(x=Reference, y=Rank, shape=SelectionIndex, color=SelectionIndex)) +
+  geom_point() + 
+  theme(axis.title.x = element_blank(),axis.title.y = element_blank(),axis.text.x = element_text(size=12,color = "black"),axis.text.y = element_text(size=12,color = "black"),legend.text = element_text(size = 10)) + 
+  geom_abline(intercept = 0, slope = 1, color = "black", size = 1) + 
+  #scale_color_manual(values=c('#E69F00','#56B4E9','#999999')) +
+    scale_color_manual(values = cluster_colors) +
+theme_minimal(); fpz
+ggsave(filename = "Figures/rank_plot_50_ind_n6011_10tr_9PC.png",plot = fpz)
+ggsave(filename = "Figures/rank_plot_50_ind_n6011_10tr_9PC.pdf",plot = fpz)
+```
+
+## Comparing EBV for SVD PCA and BPCA
+
+```{r}
+eval_ebv <- function(df.PC.svd,df.PC.bpca,title = "Scatter Plot of EBVs of PC1", filename = "Figures/compare_ebv_svd_bpca_pc1_1685.png"){
+  
+  r <- cor.test(df.PC.svd$EBV,df.PC.bpca$EBV); r
+  print(r)
+df.tmp <- data.frame(SVDPCA = df.PC.svd$EBV,BPCA = df.PC.bpca$EBV)
+# Create the scatter plot
+ebv_bpca <- ggplot(df.tmp, aes(x = SVDPCA, y = BPCA)) +
+  geom_point() +                  # Add scatter points
+  #geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", size = 2) +  # Add 1-1 line
+  geom_smooth(method = "lm", linetype = "dashed", color = "red", se = FALSE, size = 2) +  # Add linear regression line
+  labs(x = "SVDPCA", y = "BPCA") +  # Label axes
+  ggtitle(title) +  # Add a title
+# Add text with correlation results
+  geom_text(x = max(df.tmp$SVDPCA)-0.45, y = min(df.tmp$BPCA)+0.4, label = paste("r =", round(r$estimate, 2), "\np =", format.pval(r$p.value)), size = 3) +
+  theme(axis.text = element_text(size = 10,color = "black")); ebv_bpca
+ggsave(filename = filename,plot = ebv_bpca)
+  
+  return(ebv_bpca)
+  
+}
+###### 1685 data
+# change correlation direction
+#df.PC1.b$EBV<- -df.PC1.b$EBV
+#df.PC2.b$EBV<- -df.PC2.b$EBV
+#df.PC3.b$EBV<- -df.PC3.b$EBV
+# df.PC1 vs df.PC1.b
+ebv_bpca1 <- eval_ebv(df.PC1.1685,df.PC1.b,title = "PC1", filename = "Figures/compare_ebv_svd_bpca_pc1_1685.png")
+
+# df.PC2 vs df.PC2.b
+ebv_bpca2 <- eval_ebv(df.PC2.1685,df.PC2.b,title = "PC2", filename = "Figures/compare_ebv_svd_bpca_pc2_1685.png")
+
+# df.PC3 vs df.PC3.b
+ebv_bpca3 <- eval_ebv(df.PC3.1685,df.PC3.b,title = "PC3", filename = "Figures/compare_ebv_svd_bpca_pc3_1685.png")
+
+###### 6044 data
+# df.PC1 vs df.PC1.s
+ebv_bpca11 <- eval_ebv(df.PC1.s,df.PC1.imp,title = "PC1", filename = "Figures/compare_ebv_svd_bpca_pc1_6044.png")
+
+# df.PC2 vs df.PC2.s
+ebv_bpca12 <- eval_ebv(df.PC2.s,df.PC2.imp,title = "PC2", filename = "Figures/compare_ebv_svd_bpca_pc2_6044.png")
+# df.PC3 vs df.PC3.s
+ebv_bpca13 <- eval_ebv(df.PC3.s,df.PC3.imp,title = "PC3", filename = "Figures/compare_ebv_svd_bpca_pc3_6044.png")
+figure1 <- ebv_bpca1
+figure2 <- ebv_bpca2
+figure3 <- ebv_bpca3
+figure11 <- ebv_bpca11
+figure12 <- ebv_bpca12
+figure13 <- ebv_bpca13
+
+# Arrange and display the figures in a grid
+gp <- plot_grid(
+  figure1, figure11, figure2,
+  figure12, figure3, figure13,
+  labels = c("A","B","C","D","E","F"),
+  ncol = 2  # Number of columns in the grid (you can adjust this)
+); gp
+gp1 <- plot_grid(
+  figure1, figure2, figure3, labels = c('A', 'B', 'C'),
+  ncol = 2  # Number of columns in the grid (you can adjust this)
+); gp1
+gp2 <- plot_grid(
+  figure11, figure12, figure13, labels = c('A', 'B', 'C'),
+  ncol = 2  # Number of columns in the grid (you can adjust this)
+); gp2
+ggsave(filename = "Figures/corr_PCs_PCA_BPCA_1685.png", plot = gp1)
+ggsave(filename = "Figures/corr_PCs_PCA_BPCA_1685.pdf", plot = gp1)
+ggsave(filename = "Figures/corr_PCs_PCA_BPCA_6044.png", plot = gp2)
+ggsave(filename = "Figures/corr_PCs_PCA_BPCA_6044.pdf", plot = gp2)
+ggsave(filename = "Figures/corr_PCs_PCA_BPCA_joint_fig.png", plot = gp)
+ggsave(filename = "Figures/corr_PCs_PCA_BPCA_joint_fig.pdf", plot = gp)
+ggsave(filename = "Figures/Manuscript/Supplementary_figure_S4.png", plot = gp,dpi = 300,height = 10,width = 10)
+ggsave(filename = "Figures/Manuscript/Supplementary_figure_S4.pdf", plot = gp,dpi = 300,height = 10,width = 10)
+```
+
+
+## MegaLMM
+
+```{r}
+run_parameters = MegaLMM_control(
+  h2_divisions = 20, 
+    # Each variance component is allowed to explain between 0% and 100% of the
+      # total variation. How many segments should the range [0,100) be divided 
+      # into for each random effect?
+  burn = 0,  
+    # number of burn in samples before saving posterior samples. I set this to 
+      # zero and instead run the chain in small chunks, doing the burning manually, a
+      # s described below.
+  thin = 2,
+    # during sampling, we'll save every 2nd sample to the posterior database.
+  K = 10 # number of factors. 
+)
+
+priors = MegaLMM_priors(
+  tot_Y_var = list(V = 0.5,   nu = 5),      # Prior variance of trait residuals after accounting for fixed effects and factors
+  tot_F_var = list(V = 18/20, nu = 20),     # Prior variance of factor traits. This is included to improve MCMC mixing, but can be turned off by setting nu very large
+  Lambda_prior = list(
+    sampler = sample_Lambda_prec_horseshoe,
+    prop_0 = 0.1,
+    delta = list(shape = 3, scale = 1),
+    delta_iterations_factor = 100
+  ),
+  B2_prior = list(
+    sampler = sample_B2_prec_horseshoe,
+    prop_0 = 0.1
+  ),
+  cis_effects_prior = list(
+    prec = 1
+  ),
+  h2_priors_resids_fun = function(h2s,n)  1,  # Function that returns the prior density for any value of the h2s vector (ie the vector of random effect proportional variances across all random effects. 1 means constant prior. Alternative: pmax(pmin(ddirichlet(c(h2s,1-sum(h2s)),rep(2,length(h2s)+1)),10),1e-10),
+  h2_priors_factors_fun = function(h2s,n) 1 # See above. Another choice is one that gives 50% weight to h2==0: ifelse(h2s == 0,n,n/(n-1))
+)
+
+options(error=recover)
+
+## set up run
+# Find the common names between dataF264_v4 and Amat
+common_names <- intersect(dataF264_v4$Genotype_id, rownames(Amat))
+print(common_names)
+# Filter dataF264_v4 based on Genotype_id
+filtered_dataF264_norm <- dataF264_v4[dataF264_v4$Genotype_id %in% common_names, ]
+# Y phenotype data matrix
+rownames(filtered_dataF264_norm) <- filtered_dataF264_norm$Genotype_id
+filtered_dataF264_norm <- filtered_dataF264_norm %>%
+  mutate(Genotype_id = as.factor(Genotype_id))
+
+Y <- filtered_dataF264_norm %>%
+  select(-c(Genotype_id,Family_id))
+# Create a data frame with 270 rows and the same number of columns as Y, filled with NA
+na_rows <- data.frame(matrix(NA, nrow = 270, ncol = ncol(Y)))
+colnames(na_rows) <- colnames(Y)
+# Add the NA rows on top of the existing data frame Y
+Y <- rbind(na_rows, Y)
+
+na_rows <- data.frame(matrix(NA, nrow = 270, ncol = ncol(filtered_dataF264_norm)))
+colnames(na_rows) <- colnames(filtered_dataF264_norm)
+# Add the NA rows on top of the existing data frame Y
+filtered_dataF264_norm <- rbind(na_rows, filtered_dataF264_norm)
+filtered_dataF264_norm$Genotype_id[1:270] <- as.character(seq(1,270))
+# Relationship matrix
+Amat <- Amat %>%
+  as.data.frame()
+
+common_names2 <- c(as.character(seq(1,270)),common_names)
+# Select the rows and columns based on the common names
+Amat1641 <- Amat[common_names2, common_names2]
+# The function `setup_model_MegaLMM` parses the model formulas, links the GRM to the random effects, and creates an object to store all components of the model.
+MegaLMM_state = setup_model_MegaLMM(
+  Y = Y,  
+    # The n x p trait matrix
+  formula = ~ (1|Genotype_id),  
+    # This is syntax like lme4 for mixed effect models. 
+      # We specify a fixed effect of population and a random effect for genotype (Line)
+  data = filtered_dataF264_norm,         
+    # the data.frame with information for constructing the model matrices
+  relmat = list(Genotype_id = Amat1641), 
+    # A list of covariance matrices to link to the random effects in formula.
+      # each grouping variable in formula can be linked to a covariance matrix.
+      # If so, every level of the grouping variable must be in the rownames of K.
+      # additional rows of K not present in data will still be predicted 
+        # (and therefore will use memory and computational time!)
+  run_parameters=run_parameters,
+    # This list of control parameters created above
+  run_ID = sprintf('MegaLMM_scots_pine_run1')
+    # A run identifier. The function will create a folder with this name 
+      # and store lots of useful data inside it
+)
+
+maps = make_Missing_data_map(MegaLMM_state)
+
+MegaLMM_state = set_Missing_data_map(MegaLMM_state,maps$Missing_data_map)
+MegaLMM_state = set_priors_MegaLMM(MegaLMM_state,priors)
+MegaLMM_state = initialize_variables_MegaLMM(MegaLMM_state)
+#The stored matrices can also use a lot of RAM. It is a good idea to first get an estimate of how much RAM the model will need, before jumping in to the calculations. We can estimate the memory usage using the following function:
+estimate_memory_initialization_MegaLMM(MegaLMM_state)
+
+MegaLMM_state = initialize_MegaLMM(MegaLMM_state) # ,verbose = T
+# By default, `MegaLMM` stores individual posterior samples of some parameters, and posterior means of others
+# These parameters have individual samples stores
+MegaLMM_state$Posterior$posteriorSample_params
+
+# These parameters have only posterior means stores:
+MegaLMM_state$Posterior$posteriorMean_params
+
+# calculate the genetic (**G**) and residual (**R**) covariances among traits, and the additive heritability of each trait
+MegaLMM_state$Posterior$posteriorFunctions = list(
+  U = 'U_F %*% Lambda + U_R',
+  G = 't(Lambda) %*% diag(F_h2[1,]) %*% Lambda + diag(resid_h2[1,]/tot_Eta_prec[1,])',
+  R = 't(Lambda) %*% diag(1-F_h2[1,]) %*% Lambda + diag((1-resid_h2[1,])/tot_Eta_prec[1,])',
+  h2 = '(colSums(F_h2[1,]*Lambda^2)+resid_h2[1,]/tot_Eta_prec[1,])/(colSums(Lambda^2)+1/tot_Eta_prec[1,])'
+  )
+# initialize the posterior database
+MegaLMM_state = clear_Posterior(MegaLMM_state)
+```
+
+## Running MegaLMM
+
+```{r}
+n_iter = 100
+for(i in 1:5) {
+  print(sprintf('Burnin run %d',i))
+    # Factor order doesn't "mix" well in the MCMC.
+    # We can help it by manually re-ordering from biggest to smallest
+  MegaLMM_state = reorder_factors(MegaLMM_state,drop_cor_threshold = 0.6)
+    # clear any previous collected samples because we've re-started the chain 
+  MegaLMM_state = clear_Posterior(MegaLMM_state)
+    # Draw n_iter new samples, storing the chain
+  MegaLMM_state = sample_MegaLMM(MegaLMM_state,n_iter)
+    # make diagnostic plots
+  traceplot_array(MegaLMM_state$Posterior$Lambda,name = file.path(MegaLMM_state$run_ID,'Lambda.pdf'))
+  traceplot_array(MegaLMM_state$Posterior$U,name =  file.path(MegaLMM_state$run_ID,'U.pdf'),
+                  facet_dim = 3)
+  print(sprintf('Completed %d burnin samples', MegaLMM_state$current_state$nrun))
+}
+MegaLMM_state = clear_Posterior(MegaLMM_state)
+# Have a look at `Lambda.pdf` and `U.pdf` to check convergence
+########### Collect posterior samples
+n_iter = 250
+for(i in 1:4) {
+  print(sprintf('Sampling run %d',i))
+  MegaLMM_state = sample_MegaLMM(MegaLMM_state,n_iter) 
+  MegaLMM_state = save_posterior_chunk(MegaLMM_state)
+  print(MegaLMM_state)
+}
+```
+Thinning rate is 2, running a total of 1000 sampling iterations, ending up with 500 posterior samples.
+
+## Post analysis
+Accessing posterior distributions
+```{r}
+Lambda_samples = load_posterior_param(MegaLMM_state,'Lambda')
+U_samples = load_posterior_param(MegaLMM_state,'U')
+dim(U_samples)
+U_hat = get_posterior_mean(U_samples) # `U_hat` is the predicted additive genetic value for every genotype for every trait.
+dim(U_hat)
+Eta_mean = load_posterior_param(MegaLMM_state,'Eta_mean') #  the predicted total genetic value
+print(MegaLMM_state)
+summary(MegaLMM_state)
+plot(U_samples[,1,2],type='l')
+#traceplot_array(MegaLMM_state$Posterior$U,facet_dim = 2,name = 'U')
+U_HPD = get_posterior_HPDinterval(U_samples,prob = 0.95)
+dim(U_HPD)
+G_samples = load_posterior_param(MegaLMM_state,'G')
+dim(G_samples)
+G_hat = get_posterior_mean(G_samples) # Get posterior mean of covariances for the traits
+```
+## Calculate indicies for comparison with PCA
+
+```{r}
+
+############
+reorder_rank2 <- function(ind.rank){
+  # column 1 is the classic procedure
+  # column 2 is the PC approach 
+  # column 3 is the MegaLMM approach
+  nr <- nrow(ind.rank)
+  ind.rank.n <- matrix(0,nr,2)
+  for (i in 1:nr){
+    nr1 <- ind.rank[i,1]
+    ind.rank.n[which(ind.rank[,2]==nr1),1]<- i
+    ind.rank.n[which(ind.rank[,3]==nr1),2]<- i
+  }
+  return(ind.rank.n)
+}
+
+# Step 1: calculate selection index using MegaLMM results
+res.mega <- U_hat %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "Genotype_id") %>%
+  mutate(Genotype_id = str_replace(Genotype_id, "::Genotype_id", "")) %>%
+  mutate(Prod_mega = 0.5*(Adj_Hjd_26 + Adj_Dia_26)) %>% # Production index
+  mutate(Qual_mega = 0.5*Prod_mega + 0.25*Adj_Gvin_26 - 0.25*Adj_Gdia_26) %>% # quality index 
+  rename(Individual = Genotype_id)
+
+
+# Step 2: compare indices
+comp <- merge(selindex,res.mega,by = "Individual")
+
+#### Production
+ind1 <- order(comp$ProdIndex,decreasing = TRUE) # Traditional
+ind2 <- order(comp$PCprod,decreasing = TRUE) # PCA
+indm <- order(comp$Prod_mega,decreasing = TRUE) # MegaLMM
+ind.rank.p <- data.frame(ClassicRankProduction = ind1,PCRankProduction = ind2,MegaLMMProd = indm)
+print(ind.rank.p[1:25,])
+
+#### Quality
+ind1 <- order(comp$QualIndex,decreasing = TRUE) # Traditional
+ind2 <- order(comp$PCqual,decreasing = TRUE) # PCA
+indm <- order(comp$Qual_mega,decreasing = TRUE) # MegaLMM
+ind.rank.q <- data.frame(ClassicRankQual = ind1,PCRankQual = ind2,MegaLMMQual = indm)
+print(ind.rank.q[1:25,])
+
+rank1 <- reorder_rank2(ind.rank.p)
+rank2 <- reorder_rank2(ind.rank.q)
+ind.rank <- data.frame(Production = rank1[,1],Quality = rank2[,1],ProductionMegaLMM = rank1[,2],QualityMegaLMM = rank2[,2],Reference = seq(1,length(rank1)))
+ind.rank.long <- melt(ind.rank,id.vars=c("Reference")) %>%
+  rename(Rank = value,SelectionIndex = variable)
+
+# Zoom in on top 50
+ind.rank.long.50 <- ind.rank.long %>%
+  filter(Reference <= 50)
+################ Kendalls tau for rank lists of reference and MegaLMM
+ind.rank.long.50.prod <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "ProductionMegaLMM")
+ind.rank.long.50.qual <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "QualityMegaLMM")
+corr_prod <- cor.test(ind.rank.long.50.prod$Rank, ind.rank.long.50.prod$Reference, method = "kendall"); corr_prod
+corr_qual <- cor.test(ind.rank.long.50.qual$Rank, ind.rank.long.50.qual$Reference, method = "kendall"); corr_qual
+
+################ Kendalls tau for rank lists of PCA and MegaLMM
+ind.rank.long.50.prod2 <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "Production")
+ind.rank.long.50.qual2 <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "Quality")
+corr_prod2 <- cor.test(ind.rank.long.50.prod$Rank, ind.rank.long.50.prod2$Rank, method = "kendall"); corr_prod2
+corr_qual2 <- cor.test(ind.rank.long.50.qual$Rank, ind.rank.long.50.qual2$Rank, method = "kendall"); corr_qual2
+
+############### Kendalls tau for rank lists of PCA and Reference
+
+ind.rank.long.50.prod <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "Production")
+ind.rank.long.50.qual <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "Quality")
+corr_prod3 <- cor.test(ind.rank.long.50.prod$Rank, ind.rank.long.50.prod$Reference, method = "kendall"); corr_prod3
+corr_qual3 <- cor.test(ind.rank.long.50.qual$Rank, ind.rank.long.50.qual$Reference, method = "kendall"); corr_qual3
+
+######## make df
+r_est <- c(corr_qual$estimate,corr_qual2$estimate,corr_qual3$estimate,corr_prod$estimate,corr_prod2$estimate,corr_prod3$estimate)
+p_val <- c(corr_qual$p.value,corr_qual2$p.value,corr_qual3$p.value,corr_prod$p.value,corr_prod2$p.value,corr_prod3$p.value)
+index_t <- c(rep("Quality",3),rep("Production",3))
+Method <- rep("Kendall",length(r_est))
+Comparison <- rep(c("MegaLMM-Reference","PCA-MegaLMM","PCA-Reference"),2)
+Data <- rep("Scots pine",length(r_est))
+df_cor1 <- data.frame(Estimate = r_est,Pval = p_val, Index = index_t, Method = Method, Comparison = Comparison, Data = Data)
+
+##################### Pearson correlation of EBVs between MegaLMM and reference method
+
+res_q = cor.test(comp$QualIndex,comp$Qual_mega); res_q
+res_p = cor.test(comp$ProdIndex,comp$Prod_mega); res_p
+
+##################### Pearson correlation of EBVs between MegaLMM and PCA approach
+
+res_q2 = cor.test(comp$PCqual,comp$Qual_mega); res_q2
+res_p2 = cor.test(comp$PCprod,comp$Prod_mega); res_p2
+
+#####################
+
+res_q3 = cor.test(comp$PCqual,comp$QualIndex); res_q3
+res_p3 = cor.test(comp$PCprod,comp$ProdIndex); res_p3
+
+############# make df
+r_est <- c(res_q$estimate,res_q2$estimate,res_q3$estimate,res_p$estimate,res_p2$estimate,res_p3$estimate)
+p_val <- c(res_q$p.value,res_q2$p.value,res_q3$p.value,res_p$p.value,res_p2$p.value,res_p3$p.value)
+index_t <- c(rep("Quality",3),rep("Production",3))
+Method <- rep("Pearson",length(r_est))
+Comparison <- rep(c("MegaLMM-Reference","PCA-MegaLMM","PCA-Reference"),2)
+Data <- rep("Scots pine",length(r_est))
+df_cor2 <- data.frame(Estimate = r_est,Pval = p_val,Index = index_t, Method = Method, Comparison = Comparison, Data = Data)
+df_cor <- rbind(df_cor1,df_cor2)
+write.table(x = df_cor,file = "Correlation_table_Scots_pine_v2.txt",quote = FALSE, sep = ",",row.names = FALSE)
+df_cor <- read.table(file = "Correlation_table_Scots_pine_v2.txt", sep = ",",header=TRUE) %>%
+  mutate(Data = "Scots pine")
+```
+## Plot MegaLMM, PCA correlations
+
+```{r}
+df_cor$Significance <- ifelse(df_cor$Pval < 0.01, "**", ifelse(df_cor$Pval < 0.05, "*", ""))
+
+cor_p <- ggplot(df_cor, aes(x = Index, y = Estimate, fill = Comparison)) +
+  geom_bar(stat = "identity", position=position_dodge(), color="black") +
+  facet_wrap(~ Method, scales = "free") +
+  scale_fill_manual(values=c("#999999", "#E69F00", "#56B4E9")) +
+  geom_text(aes(label = Significance), position = position_dodge(width = 0.8), vjust = -0.1, color = "black") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text = element_text(size = 11),
+        axis.title = element_text(size = 12),
+        strip.text = element_text(size = 12),
+        legend.position = "bottom") +
+  labs(title = "",
+       x = "Trait type",
+       y = "Estimate"); cor_p
+ggsave(filename = "barplot_correlations.png",plot = cor_p,dpi = 300)
+ggsave(filename = "barplot_correlations.pdf",plot = cor_p,dpi = 300)
+
+ddf_cor2 <- read.table(file = "Correlation_table.txt",sep=",",header=T) # read results of the corresponding analysis of P. taeda pedigree
+ddf_cor2$Significance <- ifelse(ddf_cor2$Pval < 0.01, "**", ifelse(ddf_cor2$Pval < 0.05, "*", ""))
+ddf_cor2 <- ddf_cor2 %>%
+  filter(!grepl("bWGR",Comparison))
+cor_p2 <- ggplot(ddf_cor2, aes(x = Index, y = Estimate, fill = Comparison)) +
+  geom_bar(stat = "identity", position=position_dodge(), color="black") +
+  facet_wrap(~ Method, scales = "free") +
+  scale_fill_manual(values=c("#999999", "#E69F00", "#56B4E9")) +
+  geom_text(aes(label = Significance), position = position_dodge(width = 0.8), vjust = -0.1, color = "black") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text = element_text(size = 11),
+        axis.title = element_text(size = 12),
+        strip.text = element_text(size = 12),
+        legend.position = "none") +
+  labs(title = "",
+       x = "Trait type",
+       y = "Estimate"); cor_p2
+
+prank <- plot_grid(cor_p,cor_p2,
+          ncol = 1,
+          labels = c("Scots pine","Loblolly pine")); prank
+ggsave(filename = "joint_rank_correlation_megaLMM_PCA_ref2.png",dpi = 300, plot = prank,width = 10, height = 12)
+ggsave(filename = "joint_rank_correlation_megaLMM_PCA_ref2.pdf",dpi = 300, plot = prank,width = 10, height = 12)
+#### Save Figure 5 in main manuscript
+ggsave(filename = "Figure5.png",dpi = 300, plot = prank,width = 10, height = 12)
+ggsave(filename = "Figure5.pdf",dpi = 300, plot = prank,width = 10, height = 12)
+
+######################################
+# Venn diagram
+########### quality
+data_list <- list(Ref = ind.rank.q[1:50,"ClassicRankQual"], PCA = ind.rank.q[1:50,"PCRankQual"],MegaLMM = ind.rank.q[1:50,"MegaLMMQual"])
+
+pvq <- ggVennDiagram(data_list, label = "count",label_txtWidth = 10) +
+  scale_fill_gradient(low = "white", high = "#4981BF") +
+  theme_void() +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 8),
+        plot.subtitle = element_text(size = 8),  # Adjust the size as needed
+    plot.caption = element_text(size = 6)) +
+  labs(x = "",
+       y = ""); pvq
+############ Production
+data_list <- list(Ref = ind.rank.p[1:50,"ClassicRankProduction"], PCA = ind.rank.p[1:50,"PCRankProduction"],MegaLMM = ind.rank.p[1:50,"MegaLMMProd"])
+pvp <- ggVennDiagram(data_list, label = "count",label_txtWidth = 10) +
+  scale_fill_gradient(low = "white", high = "brown") +
+  theme_void() +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 8),
+        plot.subtitle = element_text(size = 8),  # Adjust the size as needed
+    plot.caption = element_text(size = 6)) +
+  labs(x = "",
+       y = ""); pvp
+```
+
+## Figures for manuscript
+
+```{r}
+# Arrange and display the figures in a grid
+# First figure 1685 trees, 15 traits
+fig1 <- plot_grid(
+  p2, p3, #pc12, pc13, 
+  labels = c("a","b"),
+  ncol = 1  # Number of columns in the grid 
+); fig1
+fig1alt <- plot_grid(
+  pc12, pc13, 
+  labels = c("a","b"),
+  ncol = 2  # Number of columns in the grid 
+); fig1alt
+fig2 <- plot_grid(
+  plvar, 
+  pn1, 
+  pcont1,
+  pcont2,
+  labels = c("a", "b", "c","d"),
+  ncol = 2
+); fig2
+#####  fig 3
+fig3 <- plot_grid(
+  ph2, ppch2, pc,  
+  labels = c("a","b","c"),
+  ncol = 2  # Number of columns in the grid 
+); fig3
+####### Fig 4 REML analysis of PC
+fig4 <- plot_grid(
+  ppc, fp, fpz, pvp,
+  labels = c("a","b","c","d"),
+  ncol = 2  # Number of columns in the grid
+); fig4
+# Define the desired width and height
+width <- 9  # Width in inches
+height <- 12  # Height in inches
+ggsave(filename = "Figure1_alt.pdf", plot = fig1alt,width = 8, height = 8, dpi = 300)
+ggsave(filename = "Figure1_alt.png", plot = fig1alt,width = 8, height = 8, dpi = 300)
+ggsave(filename = "Figure1.pdf", plot = fig1,width = 8, height = 8, dpi = 300)
+ggsave(filename = "Figure1.png", plot = fig1,width = 8, height = 8, dpi = 300)
+ggsave(filename = "Figure2.pdf", plot = fig2,width = width, height = height, dpi = 300)
+ggsave(filename = "Figure2.png", plot = fig2,width = width, height = height, dpi = 300)
+ggsave(filename = "Figure3.pdf", plot = fig3,width = width, height = height, dpi = 300)
+ggsave(filename = "Figure3.png", plot = fig3,width = width, height = height, dpi = 300)
+ggsave(filename = "Figure4.pdf", plot = fig4,width = 12, height = height, dpi = 300)
+ggsave(filename = "Figure4.png", plot = fig4,width = 12, height = height, dpi = 300)
+ggsave(filename = "Supplementary_figure_S3.pdf", plot = pvq,width = 12, height = height, dpi = 300)
+ggsave(filename = "Supplementary_figure_S3.png", plot = pvq,width = 12, height = height, dpi = 300)
+```
+
+## Check running times
+
+```{r}
+# Get the number of objects in the list
+t <- vector(length = length(res.list))
+start.val.add = start.val.res <- c(0,0.01,0)
+dataF264_norm <- dataF264_norm %>%
+  mutate(Genotype_id = as.factor(Genotype_id))
+for(i in 1:num_objects){
+    cat(sprintf('*******************\ni = %d\n\nTrait 1: %s, trait 2: %s\n',i,df_lists_comb[1,i],df_lists_comb[2,i]))
+    start.val.add[1] <- G[1,which(dimnames(G)[[2]]==df_lists_comb[1,i])]
+    start.val.add[3] <- G[1,which(dimnames(G)[[2]]==df_lists_comb[2,i])]
+    start.val.res[1] <- R[1,which(dimnames(R)[[2]]==df_lists_comb[1,i])]
+    start.val.res[3] <- R[1,which(dimnames(R)[[2]]==df_lists_comb[2,i])] 
+    Trait1 <- df_lists_comb[1,i]
+    Trait2 <- df_lists_comb[2,i]
+    t[i] <- timing_result <- system.time(
+      res.as <- asreml(
+        fixed = cbind(Adj_Dia_14, Adj_Dia_26) ~ trait, # Trait1,Trait2
+        random = ~ us(trait, init = start.val.add):vm(Genotype_id, ainv), #+ 
+        residual = ~ id(units):us(trait, init = start.val.res),
+        data = dataF264_norm,
+        ai.sing=TRUE, 
+        na.action = na.method(x = "include", y = "include"),
+        maxit = 1000
+      ) 
+    )
+
+  # Extract the elapsed time
+  elapsed_time <- timing_result[["elapsed"]]
+  cat("Elapsed time:", elapsed_time, "seconds\n")
+}
+cat("Average elapsed time:", mean(t), "seconds (",sd(t),")\n")
+cat(sprintf('Total computing time: %f\n',sum(t)))
+
+# Calculating BLUP
+timing_result <- system.time(
+ final.tmp <- asreml(
+  fixed = cbind(Adj_Dia_14,Adj_Dia_26, Adj_Dia_47,Adj_Ftopp_47,Adj_Gant_14,Adj_Gdia_26,Adj_Gdiagr130_14, Adj_Gvin_26, Adj_Gvingr130_14, Adj_Hjd_10, Adj_Hjd_14, Adj_Hjd_26, Adj_Hjd_47, Adj_Sprant_14, Adj_Sprant_26) ~ trait,
+  random = ~ us(trait):vm(Genotype_id, ainv),
+  residual = ~ id(units):us(trait),
+  data = dataF264_norm,
+  #sna.action = na.method(x = "include", y = "include"),
+  maxit = 10000,
+  G.param = iv.G,
+  R.param = iv.R,
+  update.Gcon=FALSE,
+  update.Rcon=FALSE,
+  workspace="2048mb"
+  )
+)
+  elapsed_time <- timing_result[["elapsed"]]
+  cat("Elapsed time:", elapsed_time, "seconds\n")
+```
+
+
+
+## MegaLMM analysis of PCs
+
+```{r}
+run_parameters = MegaLMM_control(
+  h2_divisions = 20, 
+    # Each variance component is allowed to explain between 0% and 100% of the
+      # total variation. How many segments should the range [0,100) be divided 
+      # into for each random effect?
+  burn = 0,  
+    # number of burn in samples before saving posterior samples. I set this to 
+      # zero and instead run the chain in small chunks, doing the burning manually, a
+      # s described below.
+  thin = 2,
+    # during sampling, we'll save every 2nd sample to the posterior database.
+  K = 10 # number of factors. 
+)
+
+priors = MegaLMM_priors(
+  tot_Y_var = list(V = 0.5,   nu = 5),      # Prior variance of trait residuals after accounting for fixed effects and factors
+  tot_F_var = list(V = 18/20, nu = 20),     # Prior variance of factor traits. This is included to improve MCMC mixing, but can be turned off by setting nu very large
+  Lambda_prior = list(
+    sampler = sample_Lambda_prec_horseshoe,
+    prop_0 = 0.1,
+    delta = list(shape = 3, scale = 1),
+    delta_iterations_factor = 100
+  ),
+  B2_prior = list(
+    sampler = sample_B2_prec_horseshoe,
+    prop_0 = 0.1
+  ),
+  cis_effects_prior = list(
+    prec = 1
+  ),
+  h2_priors_resids_fun = function(h2s,n)  1,  # Function that returns the prior density for any value of the h2s vector (ie the vector of random effect proportional variances across all random effects. 1 means constant prior. Alternative: pmax(pmin(ddirichlet(c(h2s,1-sum(h2s)),rep(2,length(h2s)+1)),10),1e-10),
+  h2_priors_factors_fun = function(h2s,n) 1 # See above. Another choice is one that gives 50% weight to h2==0: ifelse(h2s == 0,n,n/(n-1))
+)
+
+options(error=recover)
+
+## set up run
+common_names <- intersect(data.pc$Genotype_id, rownames(Amat))
+print(common_names)
+filtered_dataF264_norm <- data.pc[data.pc$Genotype_id %in% common_names, ]
+# Y phenotype data matrix
+rownames(filtered_dataF264_norm) <- filtered_dataF264_norm$Genotype_id
+filtered_dataF264_norm <- filtered_dataF264_norm %>%
+  mutate(Genotype_id = as.factor(Genotype_id))
+
+Y <- filtered_dataF264_norm %>%
+  select(c(PC1,PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,PC10,PC11,PC12,PC13,PC14,PC15))
+# Create a data frame with 270 rows and the same number of columns as Y, filled with NA
+na_rows <- data.frame(matrix(NA, nrow = 270, ncol = ncol(Y)))
+colnames(na_rows) <- colnames(Y)
+# Add the NA rows on top of the existing data frame Y
+Y <- rbind(na_rows, Y)
+
+na_rows <- data.frame(matrix(NA, nrow = 270, ncol = ncol(filtered_dataF264_norm)))
+colnames(na_rows) <- colnames(filtered_dataF264_norm)
+# Add the NA rows on top of the existing data frame Y
+filtered_dataF264_norm <- rbind(na_rows, filtered_dataF264_norm)
+filtered_dataF264_norm$Genotype_id[1:270] <- as.character(seq(1,270))
+# Relationship matrix
+Amat <- Amat %>%
+  as.data.frame()
+
+common_names2 <- c(as.character(seq(1,270)),common_names)
+# Select the rows and columns based on the common names
+Amat1641 <- Amat[common_names2, common_names2]
+# The function `setup_model_MegaLMM` parses the model formulas, links the GRM to the random effects, and creates an object to store all components of the model.
+MegaLMM_state = setup_model_MegaLMM(
+  Y = Y,  
+    # The n x p trait matrix
+  formula = ~ (1|Genotype_id),  
+    # This is syntax like lme4 for mixed effect models. 
+      # We specify a fixed effect of population and a random effect for genotype (Line)
+  data = filtered_dataF264_norm,         
+    # the data.frame with information for constructing the model matrices
+  relmat = list(Genotype_id = Amat1641), 
+    # A list of covariance matrices to link to the random effects in formula.
+      # each grouping variable in formula can be linked to a covariance matrix.
+      # If so, every level of the grouping variable must be in the rownames of K.
+      # additional rows of K not present in data will still be predicted 
+        # (and therefore will use memory and computational time!)
+  run_parameters=run_parameters,
+    # This list of control parameters created above
+  run_ID = sprintf('MegaLMM_scots_pine_run1')
+    # A run identifier. The function will create a folder with this name 
+      # and store lots of useful data inside it
+)
+
+maps = make_Missing_data_map(MegaLMM_state)
+
+MegaLMM_state = set_Missing_data_map(MegaLMM_state,maps$Missing_data_map)
+MegaLMM_state = set_priors_MegaLMM(MegaLMM_state,priors)
+MegaLMM_state = initialize_variables_MegaLMM(MegaLMM_state)
+#The stored matrices can also use a lot of RAM. It is a good idea to first get an estimate of how much RAM the model will need, before jumping in to the calculations. We can estimate the memory usage using the following function:
+estimate_memory_initialization_MegaLMM(MegaLMM_state)
+
+MegaLMM_state = initialize_MegaLMM(MegaLMM_state) # ,verbose = T
+# By default, `MegaLMM` stores individual posterior samples of some parameters, and posterior means of others
+# These parameters have individual samples stores
+MegaLMM_state$Posterior$posteriorSample_params
+
+# These parameters have only posterior means stores:
+MegaLMM_state$Posterior$posteriorMean_params
+
+# calculate the genetic (**G**) and residual (**R**) covariances among traits, and the additive heritability of each trait
+MegaLMM_state$Posterior$posteriorFunctions = list(
+  U = 'U_F %*% Lambda + U_R',
+  G = 't(Lambda) %*% diag(F_h2[1,]) %*% Lambda + diag(resid_h2[1,]/tot_Eta_prec[1,])',
+  R = 't(Lambda) %*% diag(1-F_h2[1,]) %*% Lambda + diag((1-resid_h2[1,])/tot_Eta_prec[1,])',
+  h2 = '(colSums(F_h2[1,]*Lambda^2)+resid_h2[1,]/tot_Eta_prec[1,])/(colSums(Lambda^2)+1/tot_Eta_prec[1,])'
+  )
+# initialize the posterior database
+MegaLMM_state = clear_Posterior(MegaLMM_state)
+```
+## Running MegaLMM on PCs
+
+```{r}
+n_iter = 100
+for(i in 1:5) {
+  print(sprintf('Burnin run %d',i))
+    # Factor order doesn't "mix" well in the MCMC.
+    # We can help it by manually re-ordering from biggest to smallest
+  MegaLMM_state = reorder_factors(MegaLMM_state,drop_cor_threshold = 0.6)
+    # clear any previous collected samples because we've re-started the chain 
+  MegaLMM_state = clear_Posterior(MegaLMM_state)
+    # Draw n_iter new samples, storing the chain
+  MegaLMM_state = sample_MegaLMM(MegaLMM_state,n_iter)
+    # make diagnostic plots
+  traceplot_array(MegaLMM_state$Posterior$Lambda,name = file.path(MegaLMM_state$run_ID,'Lambda.pdf'))
+  traceplot_array(MegaLMM_state$Posterior$U,name =  file.path(MegaLMM_state$run_ID,'U.pdf'),
+                  facet_dim = 3)
+  print(sprintf('Completed %d burnin samples', MegaLMM_state$current_state$nrun))
+}
+MegaLMM_state = clear_Posterior(MegaLMM_state)
+# Have a look at `Lambda.pdf` and `U.pdf` to check convergence
+########### Collect posterior samples
+n_iter = 250
+for(i in 1:4) {
+  print(sprintf('Sampling run %d',i))
+  MegaLMM_state = sample_MegaLMM(MegaLMM_state,n_iter) 
+  MegaLMM_state = save_posterior_chunk(MegaLMM_state)
+  print(MegaLMM_state)
+}
+```
+Thinning rate is 2, running a total of 1000 sampling iterations, ending up with 500 posterior samples.
+
+## Post analysis PCs
+Accessing posterior distributions
+```{r}
+Lambda_samples = load_posterior_param(MegaLMM_state,'Lambda')
+U_samples_PC = load_posterior_param(MegaLMM_state,'U')
+dim(U_samples_PC)
+U_hat_PCs = get_posterior_mean(U_samples_PC) # `U_hat` is the predicted additive genetic value for every genotype for every trait.
+dim(U_hat_PCs)
+Eta_mean = load_posterior_param(MegaLMM_state,'Eta_mean') #  the predicted total genetic value
+print(MegaLMM_state)
+summary(MegaLMM_state)
+plot(U_samples_PC[,1,2],type='l')
+U_HPD = get_posterior_HPDinterval(U_samples_PC,prob = 0.95)
+dim(U_HPD)
+G_samples = load_posterior_param(MegaLMM_state,'G')
+dim(G_samples)
+G_hat = get_posterior_mean(G_samples) # Get posterior mean of covariances for the traits
+
+
+corG <- cov2cor(G_hat)
+corGl <- melt(corG) 
+colnames(corGl) <- c("Trait1","Trait2","Correlation")
+corGl <- corGl %>%
+  mutate(Trait1 = as.factor(Trait1)) %>%
+  mutate(Trait2 = as.factor(Trait2))
+
+pcorpcM <- ggplot(data = corGl, aes(Trait2, Trait1, fill = Correlation))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+   name="Correlation") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    hjust = 1),axis.title = element_blank(),legend.text = element_text(size = 10),legend.title = element_text(size = 10), axis.text = element_text(size = 9))+
+ coord_fixed(); pcorpcM
+
+ggsave(filename = "cor_PC_MegaLMM_scots_pine.pdf",plot = pcorpcM,dpi = 300)
+```

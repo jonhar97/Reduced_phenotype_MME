@@ -1,0 +1,2433 @@
+---
+title: "LoblollyPine"
+author: "Jon Ahlinder"
+date: '2024-09-15'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(regress)
+library(ggVennDiagram)
+library(rrBLUP)
+library(INLA)
+require(BGLR)
+require(dplyr)
+require(stats)
+require(ggplot2)
+library(MCMCglmm)
+require(reshape2)
+library(asreml)
+require(asremlPlus)
+#library(visPedigree)
+library(data.table)
+require(ggfortify)
+library(mclust) # Unsupervised clustering method
+library(brms) # Bayesian analysis using Stan
+library(nadiv) # Calculate relationship matrices
+require(tidyverse)
+require(tidyr)
+require(ggcorrplot)
+require(randomForest) # predictor selection
+require(glmnet) # predictor selection, elastic net
+require(e1071) # predictor selection, support vector machine
+require(cowplot)
+library(pcaMethods)
+library(dendextend)
+library(missForest)
+library(missForestPredict)
+library(vegan)
+library(MegaLMM)
+library(bWGR)
+library(nadiv)
+```
+
+## Functions etc
+
+```{r}
+bivar = function(trait1, trait2, data, ainv, start.val.add = NULL, start.val.res = NULL) {
+  
+  Dat <- data %>% 
+    select(c(Individual,Paternal,Maternal,Family,all_of(trait1),all_of(trait2))) 
+  colnames(Dat)[5:6] <-c("Trait1","Trait2")
+  print(head(Dat))
+  if(is.null(start.val.add)){
+  # Bivariate run
+    res.as <- asreml(
+      fixed = cbind(Trait1,Trait2) ~ trait,
+      random = ~ us(trait):vm(Individual, ainv), 
+      residual = ~ id(units):us(trait),
+      data = Dat,
+      na.action = na.method(x = "include", y = "include"),
+      ai.sing=TRUE,
+      maxit = 1000
+    )
+  }
+  else{
+    res.as <- asreml(
+      fixed = cbind(Trait1,Trait2) ~ trait,
+      random = ~ us(trait, init = start.val.add):vm(Individual, ainv),
+      residual = ~ id(units):us(trait, init = start.val.res),
+      data = Dat,
+      na.action = na.method(x = "include", y = "include"),
+      ai.sing=TRUE,
+      maxit = 1000
+    )      
+  }
+
+  return(res.as)
+}
+
+rename_ped<-function(ped){
+  
+  nind <- nrow(ped)
+  newped <- ped
+  newnum <- 1
+  for(i in 1:nind){
+    tmpnr <- ped[i,1]
+    for(j in 1:3){
+      newped[which(ped[,j]==tmpnr),j] <- newnum # ind id
+    }
+    newnum <- newnum + 1
+  }
+  
+  return(newped)
+}
+```
+
+
+## Introduction
+
+We can use PCA to calculate principal components that can then be used in principal components regression. This type of regression is often used when multicollinearity exists between predictors in a dataset.
+
+
+## Fix phenotypes
+Read phenotypes (or EBV) from csv files and fix the data frame
+```{r}
+phenotypes <- list.files(path = "Phenotypic_Data Folder/",    
+                       pattern = "*.csv",
+                       full.names = TRUE) %>% 
+  lapply(read.csv) %>%                                           
+  bind_cols
+index <- grep('Genotype',colnames(phenotypes))
+index <- index[-1]
+phenotypes <- phenotypes[,-index]
+
+p.names <- list.files(path = "Phenotypic_Data Folder/",    
+           pattern = "*.csv",
+           full.names = FALSE) %>% strsplit('_')
+files <- list.files(path = "Phenotypic_Data Folder/",    
+           pattern = "*.csv",
+           full.names = FALSE)
+write.table(files,file = "traits.txt",quote = FALSE,sep="\n",row.names = FALSE)
+phen.meta <- read.table("Phenotype_info.txt",sep = "\t",header = TRUE)
+phen.meta$TraitName <- paste(phen.meta$Trait,"_",phen.meta$Age,sep="")
+```
+
+## Data filtering
+
+```{r}
+# Use derregressed EBV
+drp_g <- phenotypes[,seq(4,ncol(phenotypes),by=3)]
+rownames(drp_g) <- phenotypes$Genotype...1
+colnames(drp_g) <- phen.meta$TraitName
+# Calculate the proportion of missing data in each column
+# Set the threshold for missing proportion
+threshold <- 0.25  # 20%
+missing_proportion <- drp_g %>%
+  summarise_all(~mean(is.na(.)))
+
+# Print the result
+mp <- print(missing_proportion) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+# Create a barplot
+bpm <- ggplot(data = mp, aes(x = variable, y = value)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(x = "Variable", y = "Missing proportion", title = "Barplot of missing proportion by variable") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)); bpm
+
+# Calculate the proportion of missing data for each row
+row_missing_proportion <- drp_g %>%
+  rowwise() %>%
+  mutate(missing_proportion = mean(is.na(c_across(everything())))) %>%
+  select(missing_proportion)
+
+# Print the result
+print(row_missing_proportion)
+# Remove columns with missing proportion greater than the threshold
+# Remove columns with too many missing values
+filtered_data <- drp_g %>%
+  select(names(which(colMeans(is.na(.)) <= threshold)))
+print(dim(filtered_data))
+# add colnames
+filtered_data <- filtered_data %>%
+  rownames_to_column(var = "Individual")
+# Remove rows with too many missing values
+threshold <- 0.4
+filtered_data <- filtered_data %>%
+  filter(rowMeans(is.na(.)) <= threshold)
+# Print the filtered data
+print(dim(filtered_data))
+phen.meta <- phen.meta %>%
+  filter(Trait != "LesionUF")
+
+```
+
+## SVD-PCA
+
+```{r}
+# Impute missing data using missForest
+# We will split the data in a training set (2/3 of the total 861 observations) and a test set (1/3 of the observations).
+
+N <- nrow(filtered_data)
+n_test <- floor(N/3)
+
+set.seed(2022)
+id_test <- sample(1:N, n_test)
+if(ncol(filtered_data)==26){
+  d_train <- filtered_data[-id_test,]
+  d_test <- filtered_data[id_test,]
+} else {
+  d_train <- filtered_data[-id_test,-1]
+  d_test <- filtered_data[id_test,-1]
+}
+  # We will impute the training set and learn the random forest imputation models at the same time using the function missForest. To later use the models learned on a training set for imputation of new observations, save_models needs to be set to TRUE.
+d_train_imp_object <- missForestPredict::missForest(d_train, save_models = TRUE, num.threads = 7)
+#The imputed training set can be found by extracting ximp dataframe from the object.
+d_train_imp <- d_train_imp_object$ximp
+head(d_train_imp)
+# We will further impute the test set using the learned imputation models. The function missForestPredict will:
+
+#initialize the missing values in each variable with the initialization “learned” from the training set (mean/mode)
+
+#imperatively predict the missing values of each variable using the learned random forest models for each iteration
+
+d_test_imp <- missForestPredict::missForestPredict(d_train_imp_object, 
+                                                     newdata = d_test)
+head(d_test_imp) 
+imp <- rbind(d_train_imp,d_test_imp)
+imp <- imp[order(as.numeric(rownames(imp))),]
+# impute the missing values
+imp2 <- missForest(xmis = filtered_data[,-1])
+# extract the imputed data matrix
+df_imp <- imp2$ximp
+
+# extract the imputation error estimate
+err <- imp$OOBerror
+#calculate principal components
+results <- prcomp(imp, scale = TRUE,center = TRUE)
+cluster_colors <- c("#2ca02c","#1f77b4","#ff7f0e")  # Blue, Orange, and Green
+# score plot
+PC <- as.data.frame(results$x)
+p1 <- ggplot(PC, aes(x = PC1, y = PC2)) + # ,color = Location
+  geom_point(); p1 
+ggsave(filename = "pc1vs2_phenotypes_missForest.png",plot = p1)
+# loading plot
+PC <- as.data.frame(results$rotation)
+PC <- cbind(PC,phen.meta)
+p2 <- ggplot(PC, aes(x = PC1, y = PC2,color = Trait_type)) +
+  geom_point(size=2) +
+  geom_text(
+    label=PC$TraitName,
+    nudge_x=0.03, nudge_y=0.03,
+    check_overlap=T,
+color = "black",
+size = 3)  +
+  theme_minimal() +
+  scale_color_manual(values = cluster_colors) +
+   theme(legend.position = "right",axis.text = element_text(size = 11,color = "black"),legend.text = element_text(size = 11)) +
+  labs(color = "Trait category") +
+  xlab("PC1 (31.0%)") +
+  ylab("PC2 (14.3%)"); p2
+ggsave(filename = "pc1vs2_phenotypes_missForest.png",plot = p2)
+p3 <- ggplot(PC, aes(x = PC1, y = PC3,color = Trait_type)) +
+  geom_point(size=2) +
+  geom_text(
+    label=PC$TraitName,
+    nudge_x=0.03, nudge_y=0.03,
+    check_overlap=T,
+    color = "black",
+    size = 3) +
+   theme_minimal() +
+  scale_color_manual(values = cluster_colors) +
+  theme(axis.text = element_text(size = 11,color = "black"),legend.text = element_text(size = 11)) +
+  labs(color = "Trait category") +
+  xlab("PC1 (31.0%)") +
+  ylab("PC3 (8.1%)"); p3
+ggsave(filename = "pc1vs3_phenotypes_missForest.png",plot = p3)
+ggsave(filename = "pc1vs3_phenotypes_missForest.pdf",plot = p3)
+#calculate total variance explained by each principal component
+var_explained = results$sdev^2 / sum(results$sdev^2)
+png("Figures/var_explained_no_comp_missForest.png")
+hist(var_explained,nclass = 30,xlab = "Variance explained",main = "")
+dev.off()
+# Create a data frame for plotting
+plot_data <- data.frame(
+  PC = 1:length(var_explained),
+  VarianceExplained = var_explained 
+)
+
+# Create a bar plot using ggplot2
+plvar <- ggplot(plot_data, aes(x = PC, y = VarianceExplained)) +
+  geom_bar(stat = "identity", fill = "steelblue",color = "black") +
+  labs(
+    x = "Principal component",
+    y = "Variance explained",
+    title = ""
+  ) +
+  theme_minimal() + 
+  theme(axis.text = element_text(size=11, color = "black"), axis.title = element_text(size = 12)); plvar
+ggsave(filename = "variance_explained_861_SVDPCA_missForest.png",plot = plvar)
+ggsave(filename = "variance_explained_861_SVDPCA_missForest.pdf",plot = plvar)
+```
+
+## BPCA
+Similar to probabilistic PCA, Bayesian PCA uses an EM approach together
+with a Bayesian model to calculate the likelihood for a reconstructed value. The algorithm seems to be tolerant to relatively high amounts of missing data
+($> 10\%$). Scores and loadings obtained with Bayesian PCA slightly differ from
+those obtained with conventional PCA. This is because BPCA was developed
+especially for missing value estimation and is based on a variational Bayesian
+framework (VBF), with automatic relevance determination (ARD). In BPCA,
+ARD leads to a different scaling of the scores, loadings and eigenvalues when
+compared to standard PCA or PPCA. The algorithm does not force orthogonality between loadings. However, the authors of the BPCA paper found
+that including an orthogonality criterion made the predictions worse. They
+also state that the difference between "real" and predicted Eigenvalues becomes
+larger when the number of observation is smaller, because it refects the lack of
+information to accurately determine true loadings from the limited and noisy
+data. As a result, weights of factors to predict missing values are not the same
+as with conventional PCA, but the missing value estimation is improved.
+BPCA was proposed by Oba et al. <br>
+Oba S. and Sato MA. and Takemasa I. and Monden M. and Matsubara
+K. and Ishii S. A Bayesian missing value estimation method for gene
+expression profle data. Bioinformatics. 2003 Nov 1;19(16):2088-96.
+```{r}
+ncomp <- 20
+# for comparison bpca on small dataset
+results.bpca <- pca(scale(filtered_data[,-1]), method = "bpca", nPcs = ncomp, verbose = TRUE,maxSteps = 10000,threshold = 1e-07)
+summary(results.bpca)
+
+missing_summary <- filtered_data[,-1] %>%
+  summarise_all(~ sum(is.na(.))) %>%
+  mutate(proportion = sum(.)/(dim(filtered_data)[1]*dim(filtered_data)[2]))
+
+# Print the number and proportion of missing data for each column
+print(missing_summary)
+## Get the estimated principal axes (loadings)
+loadings <- loadings(results.bpca) 
+## Get the estimated scores
+sc <- results.bpca@scores %>%
+  as.data.frame()
+colnames(loadings) <- paste('PC',seq(1,ncomp),sep="")
+colnames(sc) <- paste('PC',seq(1,ncomp),sep="")
+rownames(sc) <- filtered_data$Individual
+
+imputed <- completeObs(results.bpca)
+#calculate principal components on imputed data for comparison with BPCA
+results.imp <- prcomp(imputed, scale = TRUE)
+PC.imp <- as.data.frame(results.imp$x) #%>%
+rownames(PC.imp) <- filtered_data$Individual
+
+## Now make a scores and loadings plot
+slplot(results.bpca)
+R2val <- R2cum(results.bpca)
+R2 <- R2val 
+
+for (i in 2:length(R2val)){
+  R2[i] <- R2val[i]-R2val[i-1]
+}
+R2 <- R2 %>% 
+  as.data.frame() %>%
+  rownames_to_column(var = "PC")
+rownames(R2) <- paste("PC",seq(1,ncomp),sep="")
+colnames(R2) <- c("PC","Variance_explained")
+pvarex <- ggplot(data=R2,aes(x = reorder(PC,-Variance_explained), y = Variance_explained)) +
+  geom_bar(stat="identity", width=0.5, fill = "steelblue",color = "black") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  ylab("Variance proportion") +
+  xlab("Principal component"); pvarex
+ggsave(filename = "Var_explained_n861_p20.png",plot = pvarex)
+ggsave(filename = "Var_explained_n861_p20.pdf",plot = pvarex)
+
+PCn <- cbind(phen.meta,loadings)
+ 
+p1ny <- ggplot(PCn, aes(PC1, PC2, colour=Trait_type)) +
+  geom_point(size=2) +
+  theme_minimal() +
+    # Customize the color scale using the predefined palette
+  scale_color_manual(values = cluster_colors) +
+  geom_text(
+    label=PCn$TraitName,
+    nudge_x=0.03, nudge_y=0.03,
+    check_overlap=T,
+color = "black")  +
+  xlab("PC1 (31.8%)") +
+  ylab("PC2 (12.9%)"); p1ny
+p2ny <- ggplot(PCn, aes(PC1, PC3, colour=Trait_type)) +
+  geom_point(size=2) +
+  theme_minimal() +
+    # Customize the color scale using the predefined palette
+  scale_color_manual(values = cluster_colors) +
+  geom_text(
+    label=PCn$TraitName,
+    nudge_x=0.03, nudge_y=0.03,
+    check_overlap=T,
+color = "black")  +
+  xlab("PC1 (31.8%)") +
+  ylab("PC3 (8.2%)"); p2ny
+ggsave(filename = "pc1vs2_phenotypes_n861_p20.png",plot = p1ny)
+ggsave(filename = "pc1vs2_phenotypes_n861_p20.png",plot = p1ny)
+ggsave(filename = "pc1vs3_phenotypes_n861_p20.pdf",plot = p2ny)
+ggsave(filename = "pc1vs3_phenotypes_n861_p20.pdf",plot = p2ny)
+
+```
+## Testing mean trait imputation
+
+```{r}
+# impute missing data
+#replace missing values in each column with column means
+tmp <- filtered_data
+for(i in 2:ncol(filtered_data)) {
+  tmp[ , i][is.na(filtered_data[ , i])] <- mean(filtered_data[ , i], na.rm=TRUE)
+}
+#### SVD-PCA
+#calculate principal components
+results.m <- prcomp(tmp[,-1], scale = TRUE)
+cluster_colors <- c("#2ca02c","#1f77b4","#ff7f0e")  # Blue, Orange, and Green
+# score plot
+PC.m <- as.data.frame(results.m$x)
+p1m <- ggplot(PC.m, aes(x = PC1, y = PC2)) + # ,color = Location
+  geom_point(); p1m #+
+ggsave(filename = "pc1vs2_phenotypes_meanTrait.png",plot = p1m)
+# loading plot
+PC.m <- as.data.frame(results.m$rotation)
+PC.m <- cbind(PC.m,phen.meta)
+p2m <- ggplot(PC.m, aes(x = PC1, y = PC2,color = Trait_type)) +
+  geom_point(size=2) +
+  geom_text(
+    label=PC.m$TraitName,
+    nudge_x=0.03, nudge_y=0.03,
+    check_overlap=T,
+color = "black",
+size = 3)  +
+  theme_minimal() +
+  scale_color_manual(values = cluster_colors) +
+   theme(legend.position = "right",axis.text = element_text(size = 11,color = "black"),legend.text = element_text(size = 11)) +
+  labs(color = "Trait category") +
+  xlab("PC1 (31.0%)") +
+  ylab("PC2 (14.3%)"); p2m
+ggsave(filename = "pc1vs2_phenotypes_meanTrait.png",plot = p2m)
+p3m <- ggplot(PC.m, aes(x = PC1, y = PC3,color = Trait_type)) +
+  geom_point(size=2) +
+  geom_text(
+    label=PC.m$TraitName,
+    nudge_x=0.03, nudge_y=0.03,
+    check_overlap=T,
+    color = "black",
+    size = 3) +
+   theme_minimal() +
+  scale_color_manual(values = cluster_colors) +
+  theme(axis.text = element_text(size = 11,color = "black"),legend.text = element_text(size = 11)) +
+  labs(color = "Trait category") +
+  xlab("PC1 (31.0%)") +
+  ylab("PC3 (8.1%)"); p3m
+ggsave(filename = "pc1vs3_phenotypes_meanTrait.png",plot = p3m)
+ggsave(filename = "pc1vs3_phenotypes_meanTrait.pdf",plot = p3m)
+#calculate total variance explained by each principal component
+var_explained.m = results.m$sdev^2 / sum(results.m$sdev^2)
+png("var_explained_no_comp_meanTrait.png")
+hist(var_explained.m,nclass = 30,xlab = "Variance explained",main = "")
+dev.off()
+# Create a data frame for plotting
+plot_data <- data.frame(
+  PC = 1:length(var_explained.m),
+  VarianceExplained = var_explained.m 
+)
+
+# Create a bar plot using ggplot2
+plvarm <- ggplot(plot_data, aes(x = PC, y = VarianceExplained)) +
+  geom_bar(stat = "identity", fill = "steelblue",color = "black") +
+  labs(
+    x = "Principal component",
+    y = "Variance explained",
+    title = ""
+  ) +
+  theme_minimal() + 
+  theme(axis.text = element_text(size=11, color = "black"), axis.title = element_text(size = 12)); plvarm
+ggsave(filename = "variance_explained_861_SVDPCA_meanTrait.png",plot = plvarm)
+ggsave(filename = "variance_explained_861_SVDPCA_meanTrait.pdf",plot = plvarm)
+```
+
+
+## Procrustes analysis of ordinations
+
+```{r}
+## Get the estimated principal axes (loadings)
+# 861 indviduals
+loadings.b <- loadings(results.bpca) %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  mutate(Method = "BPCA") %>%
+  rename(Trait = rowname) %>%
+  select(c(Trait,PC1,PC2,PC3,Method))
+
+loadings.m <- results.m$rotation %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  mutate(Method = "Trait average") %>%
+  mutate(PC1 = - PC1) %>% # change direction for comparison
+  rename(Trait = rowname) %>%
+  select(c(Trait,PC1,PC2,PC3,Method))
+
+loadings <- results$rotation %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  mutate(Method = "missForest") %>%
+  mutate(PC1 = - PC1) %>% # change direction for comparison
+  rename(Trait = rowname) %>%
+  select(c(Trait,PC1,PC2,PC3,Method))
+loadings.861 <- rbind(loadings,loadings.b,loadings.m)
+# Create a color-blind friendly palette for the 'Method' variable
+color_palette <- c("#0072B2", "#D55E00", "darkgreen")
+
+# Create the scatter plot
+pl1 <- ggplot(loadings.861, aes(x = PC1, y = PC2, color = Method, shape = Method)) +
+  geom_point(size = 3) +  # Adjust the size of points
+  scale_color_manual(values = color_palette) +  # Apply the color palette
+  scale_shape_manual(values = c(19, 17, 15, 16)) +  # Use different shapes
+  labs(x = "PC1", y = "PC2") +
+  ggtitle("861 individuals, 26 traits") +
+  theme_minimal(); pl1  # Use a minimal theme for a clean plot
+ggsave(filename = "loadings_comparison_861_bpca_missForest_mean.png",plot = pl1)
+ggsave(filename = "loadings_comparison_861_bpca_missForest_mean.pdf",plot = pl1)
+ggsave(filename = "loadings_comparison_861_bpca_missForest_mean.png",plot = pl1)
+ggsave(filename = "Supplementary_figure_S5.png",plot = pl1)
+ggsave(filename = "Supplementary_figure_S5.pdf",plot = pl1)
+loadings.b <- loadings(results.bpca)
+d1 <- dist(loadings.b)
+d2 <- dist(results$rotation[,seq(1,20)]) # [,seq(1,5)]
+mantel(d1, d2)
+## Get the estimated scores
+scores.b <- results.bpca@scores %>%
+  as.data.frame()
+colnames(loadings.b) <- colnames(scores.b) <- paste('PC',seq(1,20),sep="")
+rownames(scores.b) <- filtered_data$Individual
+scores.b$Genotype_id <- as.factor(filtered_data$Individual)
+
+# Perform Procrustes analysis
+procrustes_result <- procrustes(d1, d2)
+
+# Get the Procrustes correlation coefficient
+procrustes_result
+plot(procrustes_result)
+summary(procrustes_result)
+# Print the Procrustes correlation coefficient
+print(procrustes_result$svd)
+###################################################
+
+```
+
+## Hierechichal clustering
+
+```{r}
+# Compute distances and hierarchical clustering
+dd <- dist(scale(t(filtered_data[,-1])), method = "euclidean")
+hc <- hclust(dd, method = "ward.D2") # ward.D2 "ward.D", "ward.D2", "single", "complete", "average" (= UPGMA), "mcquitty" (= WPGMA), "median" (= WPGMC) or "centroid" (= UPGMC)
+
+groups <- cutree(hc,k = 3)
+
+dend <- hc %>%
+  as.dendrogram %>%
+   set("branches_k_color", value = cluster_colors, k=3) %>% 
+  set("branches_lwd", 3) %>%
+  set("labels_cex", 0.9) %>%
+  set("leaves_pch",19) #%>%
+  #set("leaves_col", value = groups, k = 2)
+# plot the dend in usual "base" plotting engine:
+plot(dend)
+phc1 <- plot(dend); phc1
+dend.1685 <- dend
+png(filename = "dendrogram_trait_861_26trait.png")
+plot(dend)
+dev.off()
+postscript(file = "dendrogram_trait_861_26trait.eps")
+plot(dend)
+dev.off()
+pdf(file = "dendrogram_trait_861_26trait.pdf")
+plot(dend)
+dev.off()
+
+# Rectangle dendrogram using ggplot2
+ggd1 <- as.ggdend(dend)
+p <- ggplot(ggd1, horiz = TRUE); p         
+
+```
+
+## Gaussian mixture model to cluster groups of traits
+Not shown in the paper.
+```{r}
+colnames(drp_g) <- phen.meta$TraitName
+sData <- as.data.frame(scale(drp_g))
+BIC <- mclustBIC(sData) # Find optimum model (i.e. number of mixture components) based on BIC
+plot(BIC)
+summary(BIC)
+# K = 4 seems most optimal
+# We will stick with K=3 here for simplicity
+mod1 <- Mclust(sData,G = 3,modelNames = "VEV")
+sum.K3 <- summary(mod1, parameters = TRUE)
+print(sum.K3)
+plot(mod1, what = "classification")
+plot(mod1, what = "uncertainty")
+df.res <- as.data.frame(sum.K3$mean)
+colnames(df.res) <- c("Cluster1","Cluster2","Cluster3")
+df.res$Trait_type <- phen.meta$Trait_type
+p2 <- ggplot(df.res, aes(x = Cluster1, y = Cluster2,color = Trait_type)) +
+  geom_point(size=2) +
+  geom_text(
+    label=phen.meta$TraitName,
+    nudge_x=0.03, nudge_y=0.03,
+    check_overlap=F,
+color = "black"); p2
+ggsave(filename = "mclust_cluster1vs2_phenotypes.pdf",plot = p2)
+p3 <- ggplot(df.res, aes(x = Cluster3, y = Cluster2,color = Trait_type)) +
+  geom_point(size=2) +
+  geom_text(
+    label=phen.meta$TraitName,
+    nudge_x=0.03, nudge_y=0.03,
+    check_overlap=F,
+color = "black"); p3
+ggsave(filename = "mclust_cluster3vs2_phenotypes.pdf",plot = p3)
+p4 <- ggplot(df.res, aes(x = Cluster3, y = Cluster1,color = Trait_type)) +
+  geom_point(size=2) +
+  geom_text(
+    label=phen.meta$TraitName,
+    nudge_x=0.03, nudge_y=0.03,
+    check_overlap=F,
+color = "black"); p4
+ggsave(filename = "mclust_cluster3vs1_phenotypes.pdf",plot = p4)
+df.res <- data.frame(DBV = sData, Mixture = as.factor(mod1$classification))
+mod4 <- densityMclust(sData,G = 3) ########### NB! Time consuming....
+summary(mod4, parameters = TRUE)
+```
+
+## K-means discriminative clustering
+Not shown in the paper.
+```{r}
+sgrp.t <- kmeans(t(sData),centers = 3)
+sgrp <- kmeans(sData,centers = 3)
+df <- as.data.frame(sgrp$centers)
+rownames(df) <- c("Cluster1","Cluster2","Cluster3")
+df <- as.data.frame(t(df))
+df$Trait_type <- as.data.frame(phen.meta$Trait_type)
+colnames(df)[4] <- "Trait_type"
+df2 <- data.frame(Cluster1 = unlist(df$Cluster1),Cluster2 = unlist(df$Cluster2), Cluster3 = unlist(df$Cluster3),Trait_type = unlist(df$Trait_type))
+rownames(df2) <- phen.meta$TraitName
+p5 <- ggplot(df2, aes(x = Cluster1, y = Cluster2,color = Trait_type)) +
+  geom_point(size=2) +
+  geom_text(
+    label=phen.meta$TraitName,
+    nudge_x=0.03, nudge_y=0.03,
+    check_overlap=F,
+color = "black"); p5
+ggsave(filename = "kmeans_cluster1vs2_phenotypes.pdf",plot = p5)
+p6 <- ggplot(df2, aes(x = Cluster3, y = Cluster2,color = Trait_type)) +
+  geom_point(size=2) +
+  geom_text(
+    label=phen.meta$TraitName,
+    nudge_x=0.03, nudge_y=0.03,
+    check_overlap=F,
+color = "black"); p6
+ggsave(filename = "kmeans_cluster3vs2_phenotypes.pdf",plot = p6)
+p7 <- ggplot(df2, aes(x = Cluster3, y = Cluster1,color = Trait_type)) +
+  geom_point(size=2) +
+  geom_text(
+    label=phen.meta$TraitName,
+    nudge_x=0.03, nudge_y=0.03,
+    check_overlap=F,
+color = "black"); p7
+ggsave(filename = "kmeans_cluster3vs1_phenotypes.pdf",plot = p7)
+```
+
+## ASReml-R analysis preparations
+Heritability might differ from individual traits! Selection index assume uncorrelated individual. Grouping of traits incorporated into the analysis. Canonical transformation assume known correlations. Can you back transform PCA to individual traits EBV?
+We need to explicitly specify a covariance structure with difference covariance functions us(), idh() or corgh() which for example would estimate an unconstrained (co)variance matrix, an identity matrix and a variance and correlation matrix. Both correlations (i.e. genetic and residual) are distinct in nature. The genetic correlation reflects how much the traits are linked by genetic via polygenic effect or linkage desequilibrium, whereas the residual correlation reflects the environmental correlation or errors measurement correlation.
+BLUP should be normally distributed, if not you need to check the assumption of the model.
+```{r}
+head(drp_g)
+sData$Individual <- rownames(sData)
+
+#head(pedigree)
+
+altped <- read.table("C:/Users/joah/OneDrive - Skogforsk/Documents/Projekt/Metafounder/Rcode/Data/lP_unlimited.txt",header=T,sep=",")
+# Calculate the A matrix
+tmpped <- prepPed(altped[,1:3])
+A_matrix <- makeA(tmpped) %>%
+  as.matrix()
+
+
+data_lp <- merge(altped,sData,by = "Individual") %>%
+      filter(Individual %in% filtered_data$Individual) 
+data_lp$Individual <- as.factor(data_lp$Individual)
+data_lp$Maternal <- as.factor(data_lp$Maternal)
+data_lp$Paternal <- as.factor(data_lp$Paternal)
+data_lp$Family <- interaction(data_lp$Maternal,data_lp$Paternal)
+#as.factor(data_lp$Maternal*data_lp$Paternal)
+write.table(file = "Data/Pedigree_861.txt",x = data_lp[,1:3],quote = FALSE,sep="\t",row.names = FALSE)
+write.table(file = "Data/Data_scaled_861.txt",x = data_lp[,6:(ncol(data_lp)-1)],quote = FALSE,sep="\t",row.names = FALSE)
+# Calculate A inverse
+# ainverse() uses the method of Meuwissen and Luo (1992) to compute the inverse relationship matrix directly from the pedigree. A
+ainv.lp <- ainverse(data_lp[,1:3])
+
+
+```
+
+## Calculate the numerator relationship matrix
+Using the tabular method presented in Nilforooshan MA, Garrick D, Harris B. Alternative Ways of Computing the Numerator Relationship Matrix. Front Genet. 2021 Jul 28;12:655638. doi: 10.3389/fgene.2021.655638.
+
+```{r}
+source("tabularA.R")
+# use altped data frame
+# step 1 rename pedigree members starting from 1 rather than 14006
+renped <- rename_ped(altped[,1:3])
+Amat <- tabularA(ped = renped)
+rownames(Amat) <- colnames(Amat) <- altped[,"Individual"]
+# Pick out selection candidates
+Amat <- Amat[rownames(drp_g),rownames(drp_g)]
+write.table(x = Amat,file = "Amat_926.txt",quote = FALSE,sep="\t",row.names = FALSE,col.names = FALSE)
+Amat <- Amat[filtered_data$Individual,filtered_data$Individual]
+```
+
+## Pairwise analysis ASReml
+
+```{r}
+####################### pair-wise analysis ############################
+
+df_lists <- data_lp  %>% 
+  select(-c(HT,Max,Paternal,Maternal,Individual,Family,LesionUF_1)) %>%
+  summarise_all(list) %>% 
+  pivot_longer(cols = everything(), 
+               names_to = "var", 
+               values_to = "vector") %>% 
+  print()
+
+df_lists_comb <- combn(df_lists$var,2) 
+rownames(df_lists_comb) <- c("Trait1","Trait2")
+data_lp <- data_lp %>%
+      filter(Individual %in% filtered_data$Individual) 
+# First run all traits as single outcomes to provide starting values
+G <- R <- matrix(0,1,nrow(df_lists)) # F <- 
+colnames(G) <- colnames(R) <- df_lists$var # colnames(F) <- 
+h2.s <- data.frame(Estimate = 0, SE = 0, Trait = "NA")
+for(i in 1:nrow(df_lists)){
+  trait <- df_lists$var[i]
+  Dat <- data_lp %>% 
+    select(c(Individual,Paternal,Maternal,Family,trait,LesionUF_1)) %>%
+    rename(Trait = all_of(trait))
+
+  cat(sprintf('Run %d\nAnalyzing trait %s\n',i,trait))
+  # Univariate run
+  res.as <- asreml(Trait ~ 1, random = ~vm(Individual, ainv.lp), maxit = 7, ai.sing=TRUE, data = Dat)
+  summary(res.as)$varcomp
+  G[i] <- summary(res.as)$varcomp[1,1]
+  R[i] <- summary(res.as)$varcomp[2,1]
+  tmp <- vpredict(res.as, h2 ~ V1/(V1+V2)) %>%
+    mutate(Trait = trait)
+  rownames(tmp) <- paste("h2_",trait,sep="")
+  h2.s[nrow(h2.s)+1,] <- tmp
+}
+h2.s <- h2.s[-1,]
+print(h2.s)
+# ASReml call
+res.list <- list()
+start.val.add <- start.val.res <- c(0,0.01,0)
+Gmatrix <- data
+nr <- ncol(df_lists_comb)  
+nr2 <-  nrow(df_lists)
+iv.R <- iv.G <- data.frame(Component = rep("NA",nr),Value = rep(0,nr),Constraint = rep("P",nr))
+iv.R2 <- iv.G2 <- data.frame(Component = rep("NA",nr2),Value = rep(0,nr2),Constraint = rep("P",nr2))
+corr <- matrix(0,nr2,nr2)
+rownames(iv.G2) <- rownames(iv.R2) <- rownames(corr) <- colnames(corr) <- df_lists$var # rownames(iv.F2)  <- 
+diag(corr) <- rep(1,nrow(corr))
+for(i in 1:ncol(df_lists_comb)){
+  cat(sprintf('*******************\ni = %d\n\nTrait 1: %s, trait 2: %s\n',i,df_lists_comb[1,i],df_lists_comb[2,i]))
+  start.val.add[1] <- G[1,which(dimnames(G)[[2]]==df_lists_comb[1,i])]
+  start.val.add[3] <- G[1,which(dimnames(G)[[2]]==df_lists_comb[2,i])]
+  start.val.res[1] <- R[1,which(dimnames(R)[[2]]==df_lists_comb[1,i])]
+  start.val.res[3] <- R[1,which(dimnames(R)[[2]]==df_lists_comb[2,i])] 
+  
+  res.list[[i]] <- bivar(trait1 = df_lists_comb[1,i], trait2 = df_lists_comb[2,i], data = data_lp,ainv = ainv.lp, start.val.add = start.val.add, start.val.res = start.val.res) 
+  iv.G$Component[i] <- paste('trait:vm(Individual, ainv.lp)!trait_',df_lists_comb[1,i],":",df_lists_comb[2,i],sep="")
+  iv.R$Component[i] <- paste('units:trait!trait_',df_lists_comb[1,i],":",df_lists_comb[2,i],sep="")
+  corr[df_lists_comb[1,i],df_lists_comb[2,i] ]<- corr[df_lists_comb[2,i],df_lists_comb[1,i] ] <- res.list[[i]]$vparameters[2]/sqrt(res.list[[i]]$vparameters[1] * res.list[[i]]$vparameters[3])
+  iv.G$Value[i] <- res.list[[i]]$vparameters[2] # Save covariance between trait combination # NB!
+  iv.R$Value[i] <- res.list[[i]]$vparameters[6] # NB!
+  iv.G2[df_lists_comb[1,i],1] <- paste('trait:vm(Individual, ainv.lp)!trait_',df_lists_comb[1,i],":",df_lists_comb[1,i],sep="")
+  iv.G2[df_lists_comb[2,i],1] <- paste('trait:vm(Individual, ainv.lp)!trait_',df_lists_comb[2,i],":",df_lists_comb[2,i],sep="")
+  iv.G2[df_lists_comb[1,i],2] <- res.list[[i]]$vparameters[1]
+  iv.G2[df_lists_comb[2,i],2] <- res.list[[i]]$vparameters[3]
+  iv.R2[df_lists_comb[1,i],2] <- res.list[[i]]$vparameters[5]
+  iv.R2[df_lists_comb[2,i],2] <- res.list[[i]]$vparameters[7]
+}
+iv.G <- rbind(iv.G,iv.G2)
+iv.R <- rbind(iv.R,iv.R2)
+#iv.F <- rbind(iv.F,iv.F2)
+saveRDS(object = res.list,file = "run_asreml_bivariate_26traits.RData")
+write.table(x = iv.G,file = "genetic_covariances_asreml_bivariate_26traits.txt",quote=FALSE,sep="\t")
+write.table(x = iv.R,file = "residual_covariances_asreml_bivariate_26traits.txt",quote=FALSE,sep="\t")
+write.table(x = corr,file = "genetic_correlations_asreml_bivariate_26traits.txt",quote=FALSE,sep="\t")
+
+################### plot h2 ###################
+j = 1 
+h2 <- data.frame(Estimate = 0, SE = 0, Trait = "NA",Rep = 0)
+for (i in 1:nr){
+  cat(sprintf('Estimating h2 for %d:th combination of traits %s and %s\n',i, df_lists_comb[1,i],df_lists_comb[2,i]))
+  h2.tmp1 <- vpredict(res.list[[i]], h2 ~ V1/(V1+V5)) %>% # NB include family component
+    mutate(Trait = df_lists_comb[1,i]) %>%
+    mutate(Rep = i)
+  rownames(h2.tmp1) = paste("h2_n",j,sep="")
+  h2[nrow(h2) + 1,] = h2.tmp1 
+  j <- j + 1
+    h2.tmp2 <- vpredict(res.list[[i]], h2 ~ V3/(V3+V7)) %>% # NB include family component
+      mutate(Trait = df_lists_comb[2,i]) %>%
+      mutate(Rep = i)
+    rownames(h2.tmp2) = paste("h2_n",j,sep="")
+  j <- j + 1
+  h2[nrow(h2) + 1,] = h2.tmp2 
+}
+h2 <- h2[-1,]
+print(h2)
+Ave.h2 <- h2 %>%
+group_by(Trait) %>%
+summarize(Estimate = mean(Estimate, na.rm=TRUE),
+          SE = mean(SE,na.rm = TRUE))
+
+ph2 <- ggplot(Ave.h2, aes(x = Trait, y = Estimate)) + # reorder(Component,Order)
+  geom_bar(stat = "identity", fill = "blue") +
+  geom_errorbar(aes(ymin = Estimate - SE, ymax = Estimate + SE), width = 0.2, position = position_dodge(width = 0.9)) +
+  labs(title = "",
+       x = "Heritability",
+       y = "Estimate") +
+  theme_classic() +
+  theme(axis.text.x = element_text(colour = "black",size = 10, angle = 90, hjust = 1),axis.text.y = element_text(colour = "black",size = 10)); ph2
+ggsave(filename = "Figures/h2_bivariate_861_26traits.png",plot = ph2)
+# create joint set
+Ave.h2$Method <- "Bivariate"
+h2.s$Method <- "Univariate"
+joint.h2 <- rbind(Ave.h2,h2.s)
+h2j <- melt(joint.h2,measure.vars = "Estimate") %>%
+  rename(Estimate = value)
+ph3 <- ggplot(h2j, aes(x = Trait, y = Estimate, fill = Method)) + # reorder(Component,Order)
+  geom_bar(stat = "identity", position=position_dodge()) +
+  geom_errorbar(aes(ymin = Estimate - SE, ymax = Estimate + SE), width = 0.2, position = position_dodge(width = 0.9)) +
+  labs(title = "",
+       x = "Heritability",
+       y = "Estimate") +
+  theme_classic() +
+  theme(axis.text.x = element_text(colour = "black",size = 10, angle = 90, hjust = 1),axis.text.y = element_text(colour = "black",size = 10)) + scale_fill_manual(values=c('#999999','#E69F00')); ph3
+ggsave(filename = "Figures/h2_original_joint_est_861_26traits.png",plot = ph3)
+# Plot genetic and residual correlations
+corr.melt <- reshape2::melt(corr)
+colnames(corr.melt) <- c("Trait1","Trait2","Correlation")
+
+pc <- ggplot(data = corr.melt, aes(Trait2, Trait1, fill = Correlation))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 10, hjust = 1),axis.title = element_blank()); pc 
+ ggsave(filename = "heatmap_correlations_asreml_861_26traits.png",plot = pc)
+# Run final model with fixed covariance matrices
+final.res <- asreml(
+  fixed = cbind(HT_1,CWAC_2,CWAL_2,HT_2,DBH_3,HT_3, DBH_4, HTLC_4,BA_6,BD_6, BLC_6, CWAC_6, CWAL_6, DBH_6, HT_6, Rootnum_10, Rootnumbin_10, Gall_vol_1, Length_1, Rustbin_1, Width_1, C5C6_4, Density_4, LateWood_4, Lignin_4, StiffnessTree_5) ~ trait,
+  random = ~ us(trait):vm(Individual, ainv.lp), # + us(trait):Family
+  residual = ~ id(units):us(trait),
+  data = data_lp,
+  na.action = na.method(x = "include", y = "include"),
+  maxit = 1000,
+  G.param = iv.G,
+  R.param = iv.R,
+  update.Gcon=FALSE,
+  update.Rcon=FALSE,
+  workspace="2048mb"
+  )
+saveRDS(object = final.res,file = "run_asreml_final_model_BLUP_861_individuals.RData")
+plot(final.res)
+
+pdf(file = "residual_plots_861.pdf")
+plot(final.res)
+dev.off()
+png(filename = "residual_plots_861.png")
+plot(final.res)
+dev.off()
+```
+
+
+## Alternatives to standard multi-trait
+PCs as response variables, univariate runs
+```{r}
+####################### analysis using PCs #############################
+## Test different number of PC:s
+# step 0 get new data frame
+
+PC <- as.data.frame(results$x) 
+imp <- as.data.frame(scale(imp))
+imp$Individual <- filtered_data$Individual
+
+data.pc <- cbind(PC,imp) 
+
+data.pc$Individual <- as.factor(x = data.pc$Individual)
+
+res.PC.bivar<- asreml(
+  fixed = cbind(PC1, PC2) ~ trait,
+  random = ~ us(trait):vm(Individual, ainv.lp),
+  residual = ~ id(units):us(trait),
+  data = data.pc,
+  #sna.action = na.method(x = "include", y = "include"),
+  maxit = 1000
+  )
+cat(sprintf('Variance component estimates:\n'))
+summary(res.PC.bivar)$varcomp
+write.table(x = data.pc,file = "phenotypes_861_taeda.txt",sep = ",",quote = FALSE,row.names = FALSE)
+res.PC1 <- asreml(
+  fixed = PC1 ~ 1, # df.pc$PC[1]
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC1: %f\n',summary(res.PC1)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC1)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC1)$varcomp['units!units','component'])))
+df1 <- data.frame(Estimate = 0, SE = 0)
+df1[nrow(df1) + 1,] = vpredict(res.PC1, PC1 ~ V1/(V1+V2))
+res.PC2 <- asreml(
+  fixed = PC2 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC2: %f\n',summary(res.PC2)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC2)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC2)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC2, PC2 ~ V1/(V1+V2))
+res.PC3 <- asreml(
+  fixed = PC3 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC3: %f\n',summary(res.PC3)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC3)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC3)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC3, PC3 ~ V1/(V1+V2))
+res.PC4 <- asreml(
+  fixed = PC4 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC4: %f\n',summary(res.PC4)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC4)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC4)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC4, PC4 ~ V1/(V1+V2))
+res.PC5 <- asreml(
+  fixed = PC5 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC5: %f\n',summary(res.PC5)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC5)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC5)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC5, PC5 ~ V1/(V1+V2))
+res.PC6 <- asreml(
+  fixed = PC6 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC6: %f\n',summary(res.PC6)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC6)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC6)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC6, PC6 ~ V1/(V1+V2))
+res.PC7 <- asreml(
+  fixed = PC7 ~ 1,
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC7: %f\n',summary(res.PC7)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC7)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC7)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC7, PC7 ~ V1/(V1+V2))
+res.PC8 <- asreml(
+  fixed = PC8 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC8: %f\n',summary(res.PC8)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC8)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC8)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC8, PC8 ~ V1/(V1+V2))
+res.PC9 <- asreml(
+  fixed = PC9 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC9: %f\n',summary(res.PC9)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC9)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC9)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC9, PC9 ~ V1/(V1+V2))
+res.PC10 <- asreml(
+  fixed = PC10 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC10: %f\n',summary(res.PC10)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC10)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC10)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC10, PC10 ~ V1/(V1+V2))
+res.PC11 <- asreml(
+  fixed = PC11 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC11: %f\n',summary(res.PC11)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC11)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC11)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC11, PC11 ~ V1/(V1+V2))
+res.PC12 <- asreml(
+  fixed = PC12 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC12: %f\n',summary(res.PC12)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC12)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC12)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC12, PC12 ~ V1/(V1+V2))
+res.PC13 <- asreml(
+  fixed = PC13 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC13: %f\n',summary(res.PC13)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC13)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC13)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC13, PC13 ~ V1/(V1+V2))
+res.PC14 <- asreml(
+  fixed = PC14 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC14: %f\n',summary(res.PC14)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC14)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC14)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC14, PC14 ~ V1/(V1+V2))
+res.PC15 <- asreml(
+  fixed = PC15 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC15: %f\n',summary(res.PC15)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC15)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC15)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC15, PC15 ~ V1/(V1+V2))
+##### PC16
+res.PC16 <- asreml(
+  fixed = PC16 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC16: %f\n',summary(res.PC16)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC16)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC16)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC16, PC16 ~ V1/(V1+V2))
+##### PC17
+res.PC17 <- asreml(
+  fixed = PC17 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC17: %f\n',summary(res.PC17)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC17)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC17)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC17, PC17 ~ V1/(V1+V2))
+##### PC18
+res.PC18 <- asreml(
+  fixed = PC18 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC18: %f\n',summary(res.PC18)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC18)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC18)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC18, PC18 ~ V1/(V1+V2))
+###### PC19
+res.PC19 <- asreml(
+  fixed = PC19 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC19: %f\n',summary(res.PC19)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC19)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC19)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC19, PC19 ~ V1/(V1+V2))
+####### PC20
+res.PC20 <- asreml(
+  fixed = PC20 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC20: %f\n',summary(res.PC20)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC20)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC20)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC20, PC20 ~ V1/(V1+V2))
+####### PC21
+res.PC21 <- asreml(
+  fixed = PC21 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC21: %f\n',summary(res.PC21)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC21)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC21)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC21, PC21 ~ V1/(V1+V2))
+####### PC22
+res.PC22 <- asreml(
+  fixed = PC22 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC22: %f\n',summary(res.PC22)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC22)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC22)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC22, PC22 ~ V1/(V1+V2))
+####### PC23
+res.PC23 <- asreml(
+  fixed = PC23 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC23: %f\n',summary(res.PC23)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC23)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC23)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC23, PC23 ~ V1/(V1+V2))
+####### PC24
+res.PC24 <- asreml(
+  fixed = PC24 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC24: %f\n',summary(res.PC24)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC24)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC24)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC24, PC24 ~ V1/(V1+V2))
+####### PC25
+res.PC25 <- asreml(
+  fixed = PC25 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC25: %f\n',summary(res.PC25)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC25)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC25)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC25, PC25 ~ V1/(V1+V2))
+####### PC26
+res.PC26 <- asreml(
+  fixed = PC26 ~ 1, 
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+cat(sprintf('Heritability of trait PC26: %f\n',summary(res.PC26)$varcomp['vm(Individual, ainv.lp)','component']/(summary(res.PC26)$varcomp['vm(Individual, ainv.lp)','component']+summary(res.PC26)$varcomp['units!units','component'])))
+df1[nrow(df1) + 1,] = vpredict(res.PC26, PC26 ~ V1/(V1+V2))
+df1 <- df1[-1,]
+print(df1)
+
+##################### Plot h2 ####################
+df1 <- df1 %>%
+  rownames_to_column() %>%
+  rename(Component = rowname)
+df1$Order = seq(1,ncol(PC))
+ppch2 <- ggplot(df1, aes(x = reorder(Component,Order), y = Estimate)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  geom_errorbar(aes(ymin = Estimate - SE, ymax = Estimate + SE), width = 0.2, position = position_dodge(width = 0.9)) +
+  labs(title = "",
+       x = "",
+       y = "Heritability") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(colour = "black",size = 11, angle = 45, hjust = 1),axis.text.y = element_text(colour = "black",size = 11),axis.title = element_text(size = 12)); ppch2
+ggsave(filename = "h2_15PC_15traits_861trees.pdf", plot = ppch2)
+ggsave(filename = "h2_15PC_15traits_861trees.png", plot = ppch2)
+########################### Plot of PC vs Phenotype correlation ########################
+# 
+
+nc1 <- which(names(data.pc) == "HT_1")
+nc2 <- ncol(data.pc)-1
+cor.mat <- as.data.frame(cor(data.pc[,c(seq(1,10),seq(nc1,nc2))]))
+rownames(cor.mat) <- colnames(cor.mat)
+
+lf.cor <- melt(as.matrix(cor.mat))
+lf.cor <- lf.cor %>%
+  filter(Var2 == 'PC1' | Var2 == 'PC2' | Var2 == 'PC3' | Var2 == 'PC4' | Var2 == 'PC5' | Var2 == 'PC6' | Var2 == 'PC7' | Var2 == 'PC8' | Var2 == 'PC9' | Var2 == 'PC10') %>%
+  filter(Var1 != 'PC1' & Var1 != 'PC2' & Var1 != 'PC3' & Var1 != 'PC4' & Var1 != 'PC5' & Var1 != 'PC6' & Var1 != 'PC7' & Var1 != 'PC8' & Var1 != 'PC9' & Var1 != 'PC10') 
+
+
+pcor <- ggplot(data = lf.cor, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+   name="Pearson\nCorrelation") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    hjust = 1,size = 9),axis.title = element_blank(),legend.text = element_text(size = 12),legend.title = element_text(size = 12))+
+ coord_fixed(); pcor
+
+ggsave(filename = "correlation_10PC_traits_861.pdf",pcor)
+ggsave(filename = "correlation_10PC_traits_861.png",pcor)
+# Set direction of PCs based on correlations with traits
+# Check loadings
+
+# Plot PC1 vs EBV for height and diameter
+# Add the regression line
+pn1 <- ggplot(data.pc, aes(x=DBH_4, y=PC1,color = 'DBH_4')) + 
+  geom_point() + 
+  geom_point(aes(x=HT_6, y=PC1,color = 'HT_6')) + 
+  geom_point(aes(x=CWAC_6, y=PC1,color = 'CWAC_6')) +
+  geom_smooth(method=lm,color="black",se = FALSE) +
+  theme(legend.title = element_text(size=14), #change legend title font size
+        legend.text = element_text(size=10),
+        axis.text=element_text(size=12),
+        axis.title=element_text(size=14)) + #change legend text font size+
+  labs(color = "Trait",size=12) +
+  xlab('Trait'); pn1
+
+```
+
+## Pairwise analyses of PCs
+
+```{r}
+res.PC.mvar<- asreml(
+  fixed = cbind(PC1, PC2, PC3, PC4, PC5, PC6, PC7, PC8, PC9, PC10) ~ trait, 
+  random = ~ us(trait):vm(Individual, ainv.lp),
+  residual = ~ id(units):us(trait),
+  data = data.pc,
+  na.action = na.method(x = "include", y = "include"),
+  maxit = 1000
+  )
+
+summary(res.PC.mvar)$varcomp
+
+df_lists2 <- data.pc  %>% 
+  select(-c(HT,Max,Paternal,Maternal,Individual,Family,HT_1,CWAC_2,CWAL_2,HT_2,DBH_3,HT_3,DBH_4,HTLC_4,BA_6 ,BD_6,BLC_6,CWAC_6,CWAL_6,DBH_6,HT_6,Rootnum_10,Rootnumbin_10,Gall_vol_1,Length_1,Rustbin_1,Width_1,C5C6_4,Density_4,LateWood_4,Lignin_4,StiffnessTree_5)) %>%
+  summarise_all(list) %>% 
+  pivot_longer(cols = everything(), 
+               names_to = "var", 
+               values_to = "vector") %>% 
+  print()
+
+df_lists_comb2 <- combn(df_lists2$var,2) 
+rownames(df_lists_comb2) <- c("Trait1","Trait2")
+
+res.list2 <- list()
+for(i in 1:ncol(df_lists_comb)){
+  res.list2[[i]] <- bivar(trait1 = df_lists_comb2[1,i], trait2 = df_lists_comb2[2,i], data = data.pc,ainv = ainv.lp, start.val.add = start.val.add, start.val.res = start.val.res)
+}
+```
+
+## Comparing differences in EBV rank lists between PC and standard approach 
+We used three different selection index:<br>
+* only production (height + diameter)
+* production + disease susceptibility (height + diameter + Rustbin_1)
+* production and wood quality (height + diameter + stiffness + density)<br>
+In Isik and McKeand (2019), they used a selection index of 0.6 volume, 0.2 stem straightness and -0.2 for fusiform rust. 
+Comparison (of EBV rank lists) are made using Kendall's tau.
+
+```{r}
+# selection index
+# Step 1: Extract EBV
+############
+reorder_rank <- function(ind.rank){
+  # column 1 is the classic procedure
+  # column 2 is the PC approach 
+  nr <- nrow(ind.rank)
+  ind.rank.n <- matrix(0,nr,1)
+  for (i in 1:nr){
+    nr1 <- ind.rank[i,1]
+    ind.rank.n[which(ind.rank[,2]==nr1)]<- i
+  }
+  return(ind.rank.n)
+}
+fix_asreml_object <- function(final.res){
+  
+  df <- as_tibble(final.res$coefficients$random)
+  df$TraitTMP <- rownames(final.res$coefficients$random)
+  df$SE <- sqrt(final.res$vcoeff$random * final.res$sigma2)
+  # Fix trait name
+
+  tmp <- unlist(strsplit(x = df$TraitTMP,split = ':')) #[row_odd]
+  row_odd <- seq_len(length(tmp)) %% 2              # Create row indicator
+  tmp2 <- unlist(strsplit(x = tmp[row_odd==0],split='_'))
+  tmp2 <- tmp2[row_odd==0]
+  tmp <- tmp[seq(1,length(tmp),2)]
+  df$Trait <-gsub('trait_', '', tmp)
+  df$Individual <- tmp2
+
+
+  # Removes the rows in Data frame
+  # which consist "Family" in the TraitTMP column and then remove the column
+  df <- df[!grepl("Family",df$TraitTMP),]
+  df <- select(df,-TraitTMP)
+  colnames(df)[1] <- "EBV"
+
+  return(as.data.frame(df))
+}
+fix_asreml_object_PC <- function(res.PC){
+  
+  df.PC <- as.data.frame(res.PC$coefficients$random)
+  df.PC$SE <- sqrt(res.PC$vcoeff$random * res.PC$sigma2)
+  df.PC <- df.PC[!grepl("Family",rownames(df.PC)),]
+  df.PC$Individual <- substr(x = rownames(df.PC),start=25,stop=nchar(rownames(df.PC)))
+  colnames(df.PC)[1] <- "EBV"  
+  
+  return(df.PC)
+}
+df.ref <- fix_asreml_object(final.res)
+df.PC1 <- fix_asreml_object_PC(res.PC1)
+df.PC2 <- fix_asreml_object_PC(res.PC2)
+df.PC3 <- fix_asreml_object_PC(res.PC3)
+df.PC4 <- fix_asreml_object_PC(res.PC4)
+df.PC5 <- fix_asreml_object_PC(res.PC5)
+df.PC6 <- fix_asreml_object_PC(res.PC6)
+df.PC7 <- fix_asreml_object_PC(res.PC7)
+df.PC8 <- fix_asreml_object_PC(res.PC8)
+df.PC9 <- fix_asreml_object_PC(res.PC9)
+df.PC10 <- fix_asreml_object_PC(res.PC10)
+df.PC11 <- fix_asreml_object_PC(res.PC11)
+df.PC12 <- fix_asreml_object_PC(res.PC12)
+df.PC13 <- fix_asreml_object_PC(res.PC13)
+df.PC14 <- fix_asreml_object_PC(res.PC14)
+df.PC15 <- fix_asreml_object_PC(res.PC15)
+df.PC16 <- fix_asreml_object_PC(res.PC16)
+df.PC17 <- fix_asreml_object_PC(res.PC17)
+df.PC18 <- fix_asreml_object_PC(res.PC18)
+df.PC19 <- fix_asreml_object_PC(res.PC19)
+df.PC20 <- fix_asreml_object_PC(res.PC20)
+df.PC21 <- fix_asreml_object_PC(res.PC21)
+df.PC22 <- fix_asreml_object_PC(res.PC22)
+df.PC23 <- fix_asreml_object_PC(res.PC23)
+df.PC24 <- fix_asreml_object_PC(res.PC24)
+df.PC25 <- fix_asreml_object_PC(res.PC25)
+df.PC26 <- fix_asreml_object_PC(res.PC26)
+# Step 2: calculate index for production (here volume), with 50% height and 50% diameter
+tmp1 <- 0.5*(df.ref[df.ref$Trait=='HT_6','EBV'] + df.ref[df.ref$Trait=='DBH_4','EBV'])
+selindex <- data_frame(PC1 =df.PC1$EBV,PC2 =df.PC2$EBV,PC3 =df.PC3$EBV,PC4 =df.PC4$EBV,PC5 =df.PC5$EBV,PC6 =df.PC6$EBV,PC7 =df.PC7$EBV,PC8 =df.PC8$EBV,PC9 =df.PC9$EBV,PC10 =df.PC10$EBV,PC11 =df.PC11$EBV,PC12 =df.PC12$EBV,PC13 =df.PC13$EBV,PC14 =df.PC14$EBV,PC15 =df.PC15$EBV,PC16 =df.PC16$EBV,PC17 =df.PC17$EBV,PC18 =df.PC18$EBV,PC19 =df.PC19$EBV,PC20 =df.PC20$EBV,PC21 =df.PC21$EBV,PC22 =df.PC22$EBV,PC23 =df.PC23$EBV,PC24 =df.PC24$EBV,PC25 =df.PC25$EBV,PC26 =df.PC26$EBV,ProdIndex = tmp1,DiseaseIndex = 0.67*tmp1 - 0.33*df.ref[df.ref$Trait=='Rustbin_1','EBV'], QualIndex = 0.5*tmp1 + 0.25*(df.ref[df.ref$Trait=='StiffnessTree_5','EBV'] + df.ref[df.ref$Trait=='Density_4','EBV']), Individual = df.ref[df.ref$Trait=='HT_6','Individual'])
+######## Create selection index of PCs ##########
+############################## Backtransform
+### df with EBVs for each tree
+data.pc.b <- selindex %>%
+  select(c(PC1,PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,PC10,PC11,PC12,PC13,PC14,PC15,PC16,PC17,PC18,PC19,PC20,PC21,PC22,PC23,PC24,PC25,PC26)) %>%
+  as.matrix()
+rotation <- as.matrix(results$rotation) # check, ok loadings
+mu <- colMeans(data.pc[,seq(which(names(data.pc) == "HT_1"),(ncol(data.pc)-1))]) # NB!
+EBV.pc <- as.data.frame(data.pc.b %*% t(rotation) + mu)
+EBV.pc$Genotype_id <- selindex$Individual
+#### update selindex
+selindex <- selindex %>% 
+  mutate(PCprod = 0.5*(EBV.pc[,"HT_6"] + EBV.pc[,"DBH_4"])) %>% # production
+  mutate(PCqual = 0.5*PCprod + 0.25*(EBV.pc[,"StiffnessTree_5"] + EBV.pc[,"Density_4"])) %>%
+  mutate(PCdisease = 0.67*PCprod - 0.33*EBV.pc[,"Rustbin_1"])
+
+
+cor.test(selindex$PCqual,selindex$QualIndex)
+
+# Order EBVs
+ind1 <- order(selindex$QualIndex,decreasing = TRUE) # Traditional
+ind2 <- order(selindex$PCqual,decreasing = TRUE) # PCA
+ind.rank.q <- data.frame(ClassicRankQuality = ind1,PCRankQuality = ind2)
+print(ind.rank.q[1:25,])
+
+ind1 <- order(selindex$DiseaseIndex,decreasing = TRUE) # Traditional
+ind2 <- order(selindex$PCdisease,decreasing = TRUE) # PCA, reverse order
+ind.rank.d <- data.frame(ClassicRankDisease = ind1,PCRankDisease = ind2)
+print(ind.rank.d[1:25,])
+ind1 <- order(selindex$ProdIndex,decreasing = TRUE) # Traditional
+ind2 <- order(selindex$PCprod,decreasing = TRUE) # PCA first PC, reverse order
+ind.rank.p <- data.frame(ClassicRankProduction = ind1,PCRankProduction = ind2)
+print(ind.rank.p[1:25,])
+
+# Plot selection coefficients to form PC based index
+sel.index <- data.frame(Quality = 0.25*(rotation["HT_6",] + rotation["DBH_4",] + rotation["StiffnessTree_5",] + rotation["Density_4",]), Production = 0.5*(rotation["HT_6",] + rotation["DBH_4",]), Disease = (1/3)*(rotation["HT_6",] + rotation["DBH_4",] - rotation["Rustbin_1",]))
+rownames(sel.index) <- colnames(selindex)[1:ncol(PC)]
+                                  
+df <- as.data.frame(colnames(selindex)[1:ncol(PC)])
+sel.index$PC <- factor(df$`colnames(selindex)[1:ncol(PC)]`,levels = c("PC1", "PC2", "PC3", "PC4", "PC5", "PC6", "PC7", "PC8", "PC9", "PC10", "PC11", "PC12", "PC13", "PC14", "PC15", "PC16", "PC17", "PC18", "PC19", "PC20", "PC21", "PC22", "PC23", "PC24", "PC25", "PC26")) # Change ordering manually
+              
+sel.index.long <- melt(sel.index) %>%
+  rename(SelectionIndex = variable, EffectSize = value)
+ppc <- ggplot(sel.index.long,aes(x = PC, y = EffectSize,fill = SelectionIndex)) +
+geom_bar(stat="identity", color="black", position=position_dodge())+
+  theme_minimal() + scale_fill_manual(values=c('#E69F00',"#2ca02c",'#56B4E9')) + # Use custom colors
+  theme(axis.text.y = element_text(size = 12, color = "black"),axis.title.x = element_blank(),legend.text = element_text(size = 10),legend.position="top",axis.text.x = element_text(size = 12, angle = 90, vjust = 0.5, hjust=1)) +
+  labs(y = "Proportion"); ppc
+ggsave(filename = "selected_PC.png",plot = ppc)
+ggsave(filename = "selected_PC.pdf",plot = ppc)
+########### rank plot ############
+rank1 <- reorder_rank(ind.rank.d)
+rank2 <- reorder_rank(ind.rank.p)
+rank3 <- reorder_rank(ind.rank.q)
+
+ind.rank <- data.frame(Disease = rank1,Production = rank2,Quality = rank3,Reference = seq(1,length(rank1)))
+ind.rank.long <- melt(ind.rank,id.vars=c("Reference")) %>%
+  rename(Rank = value,SelectionIndex = variable) %>%
+  filter(!grepl("bWGR",SelectionIndex)) %>%
+  filter(!grepl("MegaLMM",SelectionIndex)) %>%
+  mutate(SelectionIndex = droplevels(SelectionIndex))
+fp <- ggplot(ind.rank.long, aes(x=Reference, y=Rank, shape=SelectionIndex, color=SelectionIndex)) +
+  geom_point() + 
+  theme(axis.title.x = element_blank(),axis.title.y = element_blank(),axis.text.x = element_text(size=12,color = "black"),axis.text.y = element_text(size=12,color = "black"),legend.text = element_text(size = 10)) + 
+  theme_classic() +
+  geom_abline(intercept = 0, slope = 1, color = "black", size = 2) + 
+  scale_color_manual(values=c("#2ca02c",'#56B4E9','#E69F00')); fp
+ggsave(filename = "rank_plot_all_ind.png",plot = fp)
+ggsave(filename = "rank_plot_all_ind.pdf",plot = fp)
+# Zoom in on top 50
+ind.rank.long.50 <- ind.rank.long %>%
+  filter(Reference <= 50)
+fpz <- ggplot(ind.rank.long.50, aes(x=Reference, y=Rank, shape=SelectionIndex, color=SelectionIndex)) +
+  geom_point() + 
+  theme(axis.title.x = element_blank(),axis.title.y = element_blank(),axis.text.x = element_text(size=12,color = "black"),axis.text.y = element_text(size=12,color = "black"),legend.text = element_text(size = 10)) + 
+  theme_classic() +
+  geom_abline(intercept = 0, slope = 1, color = "black", size = 1) + 
+  scale_color_manual(values=c("#2ca02c",'#56B4E9','#E69F00')) +
+  ylim(0,175); fpz
+ggsave(filename = "rank_plot_50_ind.png",plot = fpz)
+ggsave(filename = "rank_plot_50_ind.pdf",plot = fpz)
+################ Kendalls tau for rank lists
+ind.rank.long.50.prod <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "Production")
+ind.rank.long.50.qual <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "Quality")
+ind.rank.long.50.dis <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "Disease")
+corr_prod <- cor.test(ind.rank.long.50.prod$Rank, ind.rank.long.50.prod$Reference, method = "kendall"); corr_prod
+corr_qual <- cor.test(ind.rank.long.50.qual$Rank, ind.rank.long.50.qual$Reference, method = "kendall"); corr_qual
+corr_dis <- cor.test(ind.rank.long.50.dis$Rank, ind.rank.long.50.dis$Reference, method = "kendall"); corr_dis
+cat(sprintf("Number of trees selected with PCA but not with the standard method based on production top 50 rank: %d\n",length(which(ind.rank.long.50.prod$Rank > 50))))
+cat(sprintf("Number of trees selected with PCA but not with the standard method based on quality top 50 rank: %d\n",length(which(ind.rank.long.50.qual$Rank > 50))))
+cat(sprintf("Number of trees selected with PCA but not with the standard method based on disease suseptability top 50 rank: %d\n",length(which(ind.rank.long.50.dis$Rank > 50))))
+selindex <- selindex %>%
+  mutate(PCqual_stand = scale(PCqual),
+         PCprod_stand = scale(PCprod),
+         PCdisease_stand = scale(PCdisease),
+         Production_stand = scale(ProdIndex),
+         Quality_stand = scale(QualIndex),
+         DIsease_stand = scale(DiseaseIndex))
+PCqual_stand <- selindex$PCqual_stand %>%
+  sort(.,decreasing = TRUE)
+PCprod_stand <- selindex$PCprod_stand %>%
+  sort(.,decreasing = TRUE)
+PCdisease_stand <- selindex$PCdisease_stand %>%
+  sort(.,decreasing = TRUE)
+Prod_stand <- selindex$Production_stand %>%
+  sort(.,decreasing = TRUE)
+Qual_stand <- selindex$Quality_stand %>%
+  sort(.,decreasing = TRUE)
+Disease_stand <- selindex$DIsease_stand %>%
+  sort(.,decreasing = TRUE)
+cat(sprintf('Average genetic merit of top 50 trees for quality, PCA appoach: %f (%f)\n',mean(PCqual_stand[1:50]),sd(PCqual_stand[1:50])))
+cat(sprintf('Average genetic merit of top 50 trees for production, PCA appoach: %f (%f)\n',mean(PCprod_stand[1:50]),sd(PCprod_stand[1:50])))
+cat(sprintf('Average genetic merit of top 50 trees for disease suseptability, PCA appoach: %f (%f)\n',mean(PCdisease_stand[1:50]),sd(PCdisease_stand[1:50])))
+cat(sprintf('Average genetic merit of top 50 trees for quality, trad appoach: %f (%f)\n',mean(Qual_stand[1:50]),sd(Qual_stand[1:50])))
+cat(sprintf('Average genetic merit of top 50 trees for production, trad appoach: %f (%f)\n',mean(Prod_stand[1:50]),sd(Prod_stand[1:50])))
+cat(sprintf('Average genetic merit of top 50 trees for disease suseptability, trad appoach: %f (%f)\n',mean(Disease_stand[1:50]),sd(Disease_stand[1:50])))
+wilcox.test(PCqual_stand[1:50],Qual_stand[1:50])
+t.test(PCqual_stand[1:50],Qual_stand[1:50])
+wilcox.test(PCprod_stand[1:50],Prod_stand[1:50])
+t.test(PCprod_stand[1:50],Prod_stand[1:50])
+wilcox.test(PCdisease_stand[1:50],Disease_stand[1:50])
+t.test(PCdisease_stand[1:50],Disease_stand[1:50])
+```
+
+
+
+## Stan via BMRS package
+We use bmrs which runs Bayesian Multilevel Models using Stan. NB we need to carefully select an adequate prior for the analysis to improve inference. 
+```{r}
+#Amat <- as.matrix(nadiv::makeA(altped2)) # Create A matrix
+
+bf_PC1 <- bf(PC1 ~ 1 + (1 | a | gr(Individual, cov = Amat))) #  + (1 | b | Family)
+bf_PC2 <- bf(PC2 ~ 1 + (1 | a | gr(Individual, cov = Amat))) #+ (1 | b | Family))
+bf_PC3 <- bf(PC3 ~ 1 + (1 | a | gr(Individual, cov = Amat))) #+ (1 | b | Family))
+
+############## PC1
+brms_m1.pc1 <- brm(
+  bf_PC1, # bf_HT3 + 
+  data = data.pc,
+  data2 = list(Amat = Amat),
+  family = gaussian(),
+  chains = 6, 
+  cores = 6
+)
+save(brms_m1.pc1, file = "brms_m1_pc1_861.rda")
+plot(brms_m1.pc1)
+summary(brms_m1.pc1)
+mcmc_plot(brms_m1.pc1, type = "acf")
+############## PC1
+brms_m1.pc2 <- brm(
+  bf_PC2, 
+  data = data.pc,
+  data2 = list(Amat = Amat),
+  family = gaussian(),
+  chains = 6, 
+  cores = 6
+)
+save(brms_m1.pc2, file = "brms_m1_pc2_861.rda")
+plot(brms_m1.pc2)
+summary(brms_m1.pc2)
+mcmc_plot(brms_m1.pc2, type = "acf")
+############## PC3
+brms_m1.pc3 <- brm(
+  bf_PC3, 
+  data = data.pc,
+  data2 = list(Amat = Amat),
+  family = gaussian(),
+  chains = 6, 
+  cores = 6
+)
+save(brms_m1.pc3, file = "brms_m1_pc3_861.rda")
+plot(brms_m1.pc3)
+summary(brms_m1.pc3)
+mcmc_plot(brms_m1.pc3, type = "acf")
+###################### heritability ###############################
+v_individual <- (VarCorr(brms_m1.pc1, summary = FALSE)$Individual$sd)^2
+v_r <- (VarCorr(brms_m1.pc1, summary = FALSE)$residual$sd)^2
+h.pc1 <- as.mcmc(v_individual / (v_individual + v_r))
+summary(h.pc1)
+v_individual <- (VarCorr(brms_m1.pc2, summary = FALSE)$Individual$sd)^2
+v_r <- (VarCorr(brms_m1.pc2, summary = FALSE)$residual$sd)^2
+h.pc2 <- as.mcmc(v_individual / (v_individual + v_r))
+summary(h.pc2)
+v_individual <- (VarCorr(brms_m1.pc3, summary = FALSE)$Individual$sd)^2
+v_r <- (VarCorr(brms_m1.pc3, summary = FALSE)$residual$sd)^2
+h.pc3 <- as.mcmc(v_individual / (v_individual + v_r))
+summary(h.pc3)
+
+plot(h.pc1)
+plot(h.pc2)
+plot(h.pc3)
+
+####################### computational time analysis #################
+T <- matrix(0,10,1)
+for(i in 1:10){
+  start_time <- Sys.time()
+  brms_m1.pc3 <- brm(
+  bf_PC3, 
+  data = data.pc,
+  data2 = list(Amat = Amat),
+  family = gaussian(),
+  chains = 6, 
+  cores = 6
+)
+  end_time <- Sys.time()
+  time_taken <- round(end_time - start_time, 2)
+  T[i] <- time_taken
+  print(paste("Execution time:", time_taken, "seconds"))
+  
+}
+cat(sprintf('Average time: %f (%f)\n',mean(T),sd(T)))
+
+```
+
+
+## Inla
+
+```{r}
+# Invert Amat
+# Compute the Cholesky decomposition
+L <- chol(Amat)
+# Invert the matrix using the Cholesky decomposition
+A_inv <- solve(t(L) %*% L)
+# get the indices and values of the non-zero elements
+ind_nnz <- which(A_inv != 0, arr.ind = TRUE)
+i <- ind_nnz[, 1]
+j <- ind_nnz[, 2]
+x <- A_inv[ind_nnz]
+# create the sparse matrix
+A_inv_sp <- sparseMatrix(i = i, j = j, x = x, dims = dim(A_inv))
+### add ID
+data.pc1 <- data.pc %>% 
+  column_to_rownames(var = "Individual")
+data.pc1 <- data.pc1[rownames(Amat),] %>%
+    mutate(ID = seq(1:nrow(data.pc1)))
+############## PC1
+model = PC1 ~ 1 + f(ID, model = "generic2", Cmatrix = A_inv_sp)
+fit_PC1 = inla(model, data=data.pc1, verbose=FALSE,num.threads = 6,
+           control.compute=list(config=T,dic=T,mlik=T,cpo=T)) # , 
+           control.predictor = list(compute = TRUE)
+sf <- summary(fit_PC1); sf
+plot(fit_PC1)
+plot(data.pc1$PC1, fit_PC1$summary.fitted.values$mean, main="Fitting result")
+plot(fit_PC1$residuals$deviance.residuals,data.pc1$PC1,xlab = "Residuals",ylab = "PC1")
+
+#Heritability
+h2.pc1 <- (1/sf[[4]][2,1])/((1/sf[[4]][2,1])+(1/sf[[4]][1,1])); h2.pc1
+### STD DEV
+  varE <- (1/sf[[4]][1,1])
+  A <- varA <- 1/sf[[4]][2,1]
+  B <- varA + varE
+  sdA <- varA - (1/(sf[[4]][2,1] + sf[[4]][2,2]))
+  sdE <- varE - (1/(sf[[4]][1,1] + sf[[4]][1,2]))
+  sdB <- sqrt(sdA^2 + sdE^2)
+  stdh2 <- (A/B)*sqrt((sdA/A)^2 + (sdB/B)^2)
+  cat(sprintf('PC1: h2 = %f (%f)\n',h2.pc1,stdh2))
+############## PC2
+model = PC2 ~ 1 + f(ID, model = "generic2", Cmatrix = A_inv_sp)
+fit_PC2 = inla(model, data=data.pc1, verbose=TRUE,
+           control.compute=list(config=T,dic=T,mlik=T,cpo=T),
+           control.predictor = list(compute = TRUE))  
+
+sf <- summary(fit_PC2); sf
+plot(fit_PC2)
+plot(data.pc1$PC2, fit_PC1$summary.fitted.values$mean, main="Fitting result")
+plot(fit_PC2$residuals$deviance.residuals,data.pc1$PC1,xlab = "Residuals",ylab = "PC2")
+
+#Heritability
+h2.pc2 <- (1/sf[[4]][2,1])/((1/sf[[4]][2,1])+(1/sf[[4]][1,1])); h2.pc2
+### STD DEV
+  varE <- (1/sf[[4]][1,1])
+  A <- varA <- 1/sf[[4]][2,1]
+  B <- varA + varE
+  sdA <- varA - (1/(sf[[4]][2,1] + sf[[4]][2,2]))
+  sdE <- varE - (1/(sf[[4]][1,1] + sf[[4]][1,2]))
+  sdB <- sqrt(sdA^2 + sdE^2)
+  stdh2 <- (A/B)*sqrt((sdA/A)^2 + (sdB/B)^2)
+  cat(sprintf('PC2: h2 = %f (%f)\n',h2.pc2,stdh2))
+############## PC3
+model = PC3 ~ 1 + f(ID, model = "generic2", Cmatrix = A_inv_sp)
+fit_PC3 = inla(model, data=data.pc1, verbose=TRUE,
+           control.compute=list(config=T,dic=T,mlik=T,cpo=T)) # , 
+           control.predictor = list(compute = TRUE)
+sf <- summary(fit_PC3); sf
+plot(fit_PC3)
+plot(data.pc1$PC3, fit_PC3$summary.fitted.values$mean, main="Fitting result")
+plot(fit_PC3$residuals$deviance.residuals,data.pc1$PC3,xlab = "Residuals",ylab = "PC3")
+
+#Heritability
+h2.pc3 <- (1/sf[[4]][2,1])/((1/sf[[4]][2,1])+(1/sf[[4]][1,1])); h2.pc3
+### STD DEV
+  varE <- (1/sf[[4]][1,1])
+  A <- varA <- 1/sf[[4]][2,1]
+  B <- varA + varE
+  sdA <- varA - (1/(sf[[4]][2,1] + sf[[4]][2,2]))
+  sdE <- varE - (1/(sf[[4]][1,1] + sf[[4]][1,2]))
+  sdB <- sqrt(sdA^2 + sdE^2)
+  stdh2 <- (A/B)*sqrt((sdA/A)^2 + (sdB/B)^2)
+  cat(sprintf('PC3: h2 = %f (%f)\n',h2.pc3,stdh2))
+
+############### computational time ###############
+nrep <- 10
+T <- matrix(0,nrep,1)
+model = PC3 ~ 1 + f(ID, model = "generic2", Cmatrix = A_inv_sp)
+for(i in 1:nrep){
+  start_time <- Sys.time()
+  fit_PC3 = inla(model, 
+                  data=data.pc1, 
+                  verbose=FALSE,
+                  num.threads = 6,
+                  control.compute=list(config=T,dic=T,mlik=T,cpo=T), 
+                  control.predictor = list(compute = TRUE),
+                  working.directory = paste0("inla_tmp_rep_",i))
+  end_time <- Sys.time()
+  time_taken <- round(end_time - start_time, 2)
+  T[i] <- time_taken
+  print(paste("Execution time:", time_taken, "seconds"))
+  
+}
+cat(sprintf('Average time: %f (%f)\n',mean(T),sd(T)))
+```
+## Sommer v2
+
+```{r}
+#################### pc1
+res.pc1 <- mmer(PC1~1,
+random=~vsr(Individual, Gu=Amat),
+rcov=~units, nIters=3,
+data=data.pc,verbose = FALSE)
+summary(res.pc1)
+vpredict(res.pc1, h2_pc1 ~ V1 / ( V1 + V2 ) )
+#################### pc2
+res.pc2 <- mmer(PC2~1,
+random=~vsr(Individual, Gu=Amat),
+rcov=~units, nIters=3,
+data=data.pc,verbose = FALSE)
+summary(res.pc2)
+vpredict(res.pc2, h2_pc2 ~ V1 / ( V1 + V2 ) )
+#################### pc3
+res.pc3 <- mmer(PC3~1,
+random=~vsr(Individual, Gu=Amat),
+rcov=~units, nIters=3,
+data=data.pc,verbose = FALSE)
+summary(res.pc3)
+vpredict(res.pc3, h2_pc3 ~ V1 / ( V1 + V2 ) )
+############### computational time ###############
+nrep <- 10
+T <- matrix(0,nrep,1)
+for(i in 1:nrep){
+  start_time <- Sys.time()
+  res.pc3 <- mmer(PC3~1,
+                  random=~vsr(Individual, Gu=Amat),
+                  rcov=~units, 
+                  nIters=1,
+                  data=data.pc,
+                  verbose = FALSE)
+  end_time <- Sys.time()
+  time_taken <- round(end_time - start_time, 2)
+  T[i] <- time_taken
+  print(paste("Execution time:", time_taken, "seconds"))
+  
+}
+cat(sprintf('Average time: %f (%f)\n',mean(T),sd(T)))
+```
+
+## BGLR
+
+```{r}
+
+# setting up the linear predictor
+ETA<-list( 
+  list(K=Amat, model='RKHS',saveEffects=FALSE) 
+)
+# Fitting the model
+######## PC1
+y <- data.pc1$PC1
+fm1<-BGLR(y=y,ETA=ETA, saveAt = "Save/saverun_BGLR_A_PC1") # nIter=12000, burnIn=2000, 
+summary(fm1)
+##### h2
+h2 <- fm1$ETA[[1]]$varU/(fm1$ETA[[1]]$varU+fm1$varE)
+# std dev
+sdB <- sqrt(fm1$ETA[[1]]$SD.varU^2 + fm1$SD.varE^2)
+B <- fm1$ETA[[1]]$varU+fm1$varE
+sdA <- fm1$ETA[[1]]$SD.varU
+A <- fm1$ETA[[1]]$varU
+stdh2 <- (A/B)*sqrt((sdA/A)^2 + (sdB/B)^2)
+cat(sprintf('PC1: h2 = %f (%f)\n',h2,stdh2))
+######## PC2
+y <- data.pc1$PC2
+fm2<-BGLR(y=y,ETA=ETA, saveAt = "Save/saverun_BGLR_A_PC2") # nIter=12000, burnIn=2000, 
+summary(fm2)
+##### h2
+h2 <- fm2$ETA[[1]]$varU/(fm2$ETA[[1]]$varU+fm2$varE)
+# std dev
+sdB <- sqrt(fm2$ETA[[1]]$SD.varU^2 + fm2$SD.varE^2)
+B <- fm2$ETA[[1]]$varU+fm2$varE
+sdA <- fm2$ETA[[1]]$SD.varU
+A <- fm2$ETA[[1]]$varU
+stdh2 <- (A/B)*sqrt((sdA/A)^2 + (sdB/B)^2)
+cat(sprintf('PC2: h2 = %f (%f)\n',h2,stdh2))
+######## PC3
+y <- data.pc1$PC3
+fm3<-BGLR(y=y,ETA=ETA, saveAt = "Save/saverun_BGLR_A_PC3") # nIter=12000, burnIn=2000, 
+summary(fm3)
+##### h2
+h2 <- fm3$ETA[[1]]$varU/(fm3$ETA[[1]]$varU+fm3$varE)
+# std dev
+sdB <- sqrt(fm3$ETA[[1]]$SD.varU^2 + fm3$SD.varE^2)
+B <- fm3$ETA[[1]]$varU+fm3$varE
+sdA <- fm3$ETA[[1]]$SD.varU
+A <- fm3$ETA[[1]]$varU
+stdh2 <- (A/B)*sqrt((sdA/A)^2 + (sdB/B)^2)
+cat(sprintf('PC3: h2 = %f (%f)\n',h2,stdh2))
+
+############### computational time ###############
+T <- matrix(0,10,1)
+y <- data.pc1$PC3
+for(i in 1:10){
+  start_time <- Sys.time()
+  fm<-BGLR(y=y,ETA=ETA)
+  end_time <- Sys.time()
+  time_taken <- round(end_time - start_time, 2)
+  T[i] <- time_taken
+  print(paste("Execution time:", time_taken, "seconds"))
+  
+}
+cat(sprintf('Average time: %f (%f)\n',mean(T),sd(T)))
+```
+
+## MCMCglmm
+
+```{r}
+
+# defining priors
+prior1.1 <- list(
+  G = list(G1 = list(V = 1, nu = 0.002)),
+  R = list(V = 1, nu = 0.002)
+)
+rownames(A_inv) <- colnames(A_inv)
+data.pc2 <- data.pc1 %>% 
+  rownames_to_column(var = "Individual") 
+rownames(data.pc2) <- data.pc2$Individual
+model1 <- MCMCglmm(PC1 ~ 1,
+  random = ~Individual, ginverse = list(Individual = A_inv),
+  data = data.pc2, prior = prior1.1
+)
+plot(model1$Sol)
+plot(model1$VCV)
+autocorr.diag(model1.1$VCV)
+posterior.heritability <- model1$VCV[, "animal"] /
+  (model1$VCV[, "animal"] + model1$VCV[, "units"])
+HPDinterval(posterior.heritability1, 0.95)
+```
+
+## Regress
+regress is a package for fitting Gaussian linear models with linear covariance structure. This function can be used for multivariate models and random effects models, and it uses a Newton-Raphson algorithm to maximize the log-likelihood of the model.<br>
+D. Clifford and P. McCullagh (2006), "The regress function" R News 6(2):6-10
+```{r}
+############# PC1
+model1 <- regress(PC1 ~ 1, ~Amat,pos= rep(TRUE,2), verbose=0, data=data.pc1) 
+# Get estimated variance components
+  blup1 <- BLUP(model1,RE="Amat") 
+  bc <- blup1$Covariance
+  varA <- summary(model1)$sigma[1]
+  varE <- summary(model1)$sigma[2]
+  h21 <- varA/(varA + varE); h21
+  ### STD DEV
+  sdA <- sqrt(model1$sigma.cov[1,1])
+  sdE <- sqrt(model1$sigma.cov[2,2])
+  sdB <- sqrt(sdA^2 + sdE^2)
+  B <- varA + varE
+  A <- varA
+  stdh2 <- (A/B)*sqrt((sdA/A)^2 + (sdB/B)^2)
+  cat(sprintf('PC1: h2 = %f (%f)\n',h21,stdh2))
+  ############# PC2
+model2 <- regress(PC2 ~ 1, ~Amat,pos= rep(TRUE,2), verbose=0, data=data.pc1) 
+# Get estimated variance components
+  blup1 <- BLUP(model2,RE="Amat") 
+  bc <- blup1$Covariance
+  varA <- summary(model2)$sigma[1]
+  varE <- summary(model2)$sigma[2]
+  h22 <- varA/(varA + varE); h22
+  ### STD DEV
+  sdA <- sqrt(model2$sigma.cov[1,1])
+  sdE <- sqrt(model2$sigma.cov[2,2])
+  sdB <- sqrt(sdA^2 + sdE^2)
+  B <- varA + varE
+  A <- varA
+  stdh2 <- (A/B)*sqrt((sdA/A)^2 + (sdB/B)^2)
+  cat(sprintf('PC2: h2 = %f (%f)\n',h22,stdh2))
+  ############# PC3
+model3 <- regress(PC3 ~ 1, ~Amat,pos= rep(TRUE,2), verbose=0, data=data.pc1) 
+# Get estimated variance components
+  blup1 <- BLUP(model3,RE="Amat") 
+  bc <- blup1$Covariance
+  varA <- summary(model3)$sigma[1]
+  varE <- summary(model3)$sigma[2]
+  h23 <- varA/(varA + varE); h23
+    ### STD DEV
+  sdA <- sqrt(model3$sigma.cov[1,1])
+  sdE <- sqrt(model3$sigma.cov[2,2])
+  sdB <- sqrt(sdA^2 + sdE^2)
+  B <- varA + varE
+  A <- varA
+  stdh2 <- (A/B)*sqrt((sdA/A)^2 + (sdB/B)^2)
+  cat(sprintf('PC3: h2 = %f (%f)\n',h23,stdh2))
+  ############### computational time ###############
+T <- matrix(0,10,1)
+y <- data.pc1$PC3
+for(i in 1:10){
+  start_time <- Sys.time()
+  model3 <- regress(PC3 ~ 1, ~Amat,pos= rep(TRUE,2), verbose=0, data=data.pc1)
+  end_time <- Sys.time()
+  time_taken <- round(end_time - start_time, 2)
+  T[i] <- time_taken
+  print(paste("Execution time:", time_taken, "seconds"))
+  
+}
+cat(sprintf('Average time: %f (%f)\n',mean(T),sd(T)))
+```
+## ASReml-r
+```{r}
+############# std error for h2
+# PC1
+A <- varA <- summary(res.PC1)$varcomp[1,1]
+sdA <- summary(res.PC1)$varcomp[1,2]
+varE <- summary(res.PC1)$varcomp[2,1]
+sdE <- summary(res.PC1)$varcomp[2,2]
+B <- varA + varE
+sdB <- sqrt(sdA^2 + sdE^2)
+stdh2 <- (A/B)*sqrt((sdA/A)^2 + (sdB/B)^2)
+h2 <- varA/(varA + varE); h2
+cat(sprintf('PC1: h2 = %f (%f)\n',h2,stdh2))
+# PC2
+A <- varA <- summary(res.PC2)$varcomp[1,1]
+sdA <- summary(res.PC2)$varcomp[1,2]
+varE <- summary(res.PC2)$varcomp[2,1]
+sdE <- summary(res.PC2)$varcomp[2,2]
+B <- varA + varE
+sdB <- sqrt(sdA^2 + sdE^2)
+stdh2 <- (A/B)*sqrt((sdA/A)^2 + (sdB/B)^2)
+h2 <- varA/(varA + varE); h2
+cat(sprintf('PC2: h2 = %f (%f)\n',h2,stdh2))
+# PC3
+A <- varA <- summary(res.PC3)$varcomp[1,1]
+sdA <- summary(res.PC3)$varcomp[1,2]
+varE <- summary(res.PC3)$varcomp[2,1]
+sdE <- summary(res.PC3)$varcomp[2,2]
+B <- varA + varE
+sdB <- sqrt(sdA^2 + sdE^2)
+stdh2 <- (A/B)*sqrt((sdA/A)^2 + (sdB/B)^2)
+h2 <- varA/(varA + varE); h2
+cat(sprintf('PC1: h2 = %f (%f)\n',h2,stdh2))
+  ############### computational time ###############
+T <- matrix(0,10,1)
+y <- data.pc1$PC3
+for(i in 1:10){
+  start_time <- Sys.time()
+  tmp <- asreml(
+  fixed = PC3 ~ 1, # df.pc$PC[1]
+  random = ~vm(Individual, ainv.lp),
+  residual = ~ idv(units),
+  data = data.pc
+)
+  end_time <- Sys.time()
+  time_taken <- round(end_time - start_time, 2)
+  T[i] <- time_taken
+  print(paste("Execution time:", time_taken, "seconds"))
+  
+}
+cat(sprintf('Average time: %f (%f)\n',mean(T),sd(T)))
+
+#Bivariate analysis time
+T <- matrix(0,ncol(df_lists_comb),1)
+
+for(i in 1:ncol(df_lists_comb)){
+  cat(sprintf('*******************\ni = %d\n\nTrait 1: %s, trait 2: %s\n',i,df_lists_comb[1,i],df_lists_comb[2,i]))
+  start_time <- Sys.time()
+  tmp <- bivar(trait1 = df_lists_comb[1,i], trait2 = df_lists_comb[2,i], data = data_lp,ainv = ainv.lp, start.val.add = start.val.add, start.val.res = start.val.res) 
+  end_time <- Sys.time()
+  time_taken <- round(end_time - start_time, 2)
+  T[i] <- time_taken
+  print(paste("Execution time:", time_taken, "seconds"))
+  
+}
+cat(sprintf('Total time: %f, Average time: %f (%f)\n',sum(T),mean(T),sd(T)))
+################ BLUP
+start_time <- Sys.time()
+tmp <- asreml(
+  fixed = cbind(HT_1,CWAC_2,CWAL_2,HT_2,DBH_3,HT_3, DBH_4, HTLC_4,BA_6,BD_6, BLC_6, CWAC_6, CWAL_6, DBH_6, HT_6, Rootnum_10, Rootnumbin_10, Gall_vol_1, Length_1, Rustbin_1, Width_1, C5C6_4, Density_4, LateWood_4, Lignin_4, StiffnessTree_5) ~ trait,
+  random = ~ us(trait):vm(Individual, ainv.lp), # + us(trait):Family
+  residual = ~ id(units):us(trait),
+  data = data_lp,
+  #sna.action = na.method(x = "include", y = "include"),
+  maxit = 1000,
+  G.param = iv.G,
+  R.param = iv.R,
+  update.Gcon=FALSE,
+  update.Rcon=FALSE,
+  workspace="2048mb"
+  )
+end_time <- Sys.time()
+time_taken <- round(end_time - start_time, 2)
+print(paste("Execution time:", time_taken, "seconds"))
+```
+
+## MegaLMM
+
+```{r}
+run_parameters = MegaLMM_control(
+  h2_divisions = 20, 
+    # Each variance component is allowed to explain between 0% and 100% of the
+      # total variation. How many segments should the range [0,100) be divided 
+      # into for each random effect?
+  burn = 0,  
+    # number of burn in samples before saving posterior samples. I set this to 
+      # zero and instead run the chain in small chunks, doing the burning manually, a
+      # s described below.
+  thin = 2,
+    # during sampling, we'll save every 2nd sample to the posterior database.
+  K = 15 # number of factors. With 19 traits, this is likely way higher than needed.
+)
+
+priors = MegaLMM_priors(
+  tot_Y_var = list(V = 0.5,   nu = 5),      # Prior variance of trait residuals after accounting for fixed effects and factors
+  tot_F_var = list(V = 18/20, nu = 20),     # Prior variance of factor traits. This is included to improve MCMC mixing, but can be turned off by setting nu very large
+  Lambda_prior = list(
+    sampler = sample_Lambda_prec_horseshoe,
+    prop_0 = 0.1,
+    delta = list(shape = 3, scale = 1),
+    delta_iterations_factor = 100
+  ),
+  B2_prior = list(
+    sampler = sample_B2_prec_horseshoe,
+    prop_0 = 0.1
+  ),
+  cis_effects_prior = list(
+    prec = 1
+  ),
+  h2_priors_resids_fun = function(h2s,n)  1,  # Function that returns the prior density for any value of the h2s vector (ie the vector of random effect proportional variances across all random effects. 1 means constant prior. Alternative: pmax(pmin(ddirichlet(c(h2s,1-sum(h2s)),rep(2,length(h2s)+1)),10),1e-10),
+  h2_priors_factors_fun = function(h2s,n) 1 # See above. Another choice is one that gives 50% weight to h2==0: ifelse(h2s == 0,n,n/(n-1))
+)
+
+options(error=recover)
+
+## set up run
+# Y phenotype data matrix
+Y <- data.pc %>%
+  select(HT_1,CWAC_2,CWAL_2,HT_2,DBH_3,HT_3,DBH_4,HTLC_4,BA_6,BD_6,BLC_6,CWAC_6,CWAL_6,DBH_6,HT_6,Rootnum_10,Rootnumbin_10,Gall_vol_1,Length_1,Rustbin_1,Width_1,C5C6_4,Density_4,LateWood_4,Lignin_4,StiffnessTree_5)
+# The function `setup_model_MegaLMM` parses the model formulas, links the GRM to the random effects, and creates an object to store all components of the model.
+MegaLMM_state = setup_model_MegaLMM(
+  Y = Y,  
+    # The n x p trait matrix
+  formula = ~ 1 + (1|Individual),  
+    # This is syntax like lme4 for mixed effect models. 
+      # We specify a fixed effect of population and a random effect for genotype (Line)
+  data = data.pc,         
+    # the data.frame with information for constructing the model matrices
+  relmat = list(Individual = Amat), 
+    # A list of covariance matrices to link to the random effects in formula.
+      # each grouping variable in formula can be linked to a covariance matrix.
+      # If so, every level of the grouping variable must be in the rownames of K.
+      # additional rows of K not present in data will still be predicted 
+        # (and therefore will use memory and computational time!)
+  run_parameters=run_parameters,
+    # This list of control parameters created above
+  run_ID = sprintf('MegaLMM_taeda_861_run3')
+    # A run identifier. The function will create a folder with this name 
+      # and store lots of useful data inside it
+)
+MegaLMM_state = setup_model_MegaLMM(Y = Y,            # n x p data matrix
+                              formula = ~(1|Individual),  # RHS of base model for factors and residuals. Fixed effects defined here only apply to the factor residuals.
+                                
+                              #extra_regressions = list(X = model.matrix(~Fixed1,data)[,-1,drop=FALSE],factors=T,resids=F), # design matrix for additional fixed effects. These coefficients will be regularized with the B2_prior above. The same model can be used for both factors and resids
+                              data = data.pc,         # the data.frame with information for constructing the model matrices
+                              relmat = list(Individual = Amat), # covariance matrices for the random effects. If not provided, assume uncorrelated
+                              run_parameters=run_parameters,
+                              run_ID = 'MegaLMM_example'
+                                )
+
+maps = make_Missing_data_map(MegaLMM_state)
+
+MegaLMM_state = set_Missing_data_map(MegaLMM_state,maps$Missing_data_map)
+MegaLMM_state = set_priors_MegaLMM(MegaLMM_state,priors)
+MegaLMM_state = initialize_variables_MegaLMM(MegaLMM_state)
+#The stored matrices can also use a lot of RAM. It is a good idea to first get an estimate of how much RAM the model will need, before jumping in to the calculations. We can estimate the memory usage using the following function:
+estimate_memory_initialization_MegaLMM(MegaLMM_state)
+
+MegaLMM_state = initialize_MegaLMM(MegaLMM_state) # ,verbose = T
+# By default, `MegaLMM` stores individual posterior samples of some parameters, and posterior means of others
+# These parameters have individual samples stores
+MegaLMM_state$Posterior$posteriorSample_params
+
+# These parameters have only posterior means stores:
+MegaLMM_state$Posterior$posteriorMean_params
+
+# calculate the genetic (**G**) and residual (**R**) covariances among traits, and the additive heritability of each trait
+MegaLMM_state$Posterior$posteriorFunctions = list(
+  U = 'U_F %*% Lambda + U_R',
+  G = 't(Lambda) %*% diag(F_h2[1,]) %*% Lambda + diag(resid_h2[1,]/tot_Eta_prec[1,])',
+  R = 't(Lambda) %*% diag(1-F_h2[1,]) %*% Lambda + diag((1-resid_h2[1,])/tot_Eta_prec[1,])',
+  h2 = '(colSums(F_h2[1,]*Lambda^2)+resid_h2[1,]/tot_Eta_prec[1,])/(colSums(Lambda^2)+1/tot_Eta_prec[1,])'
+  )
+
+```
+
+## Running MegaLMM
+
+```{r}
+# initialize the posterior database
+MegaLMM_state = clear_Posterior(MegaLMM_state)
+n_iter = 100
+for(i in 1:5) {
+  print(sprintf('Burnin run %d',i))
+    # Factor order doesn't "mix" well in the MCMC.
+    # We can help it by manually re-ordering from biggest to smallest
+  MegaLMM_state = reorder_factors(MegaLMM_state,drop_cor_threshold = 0.6)
+    # clear any previous collected samples because we've re-started the chain 
+  MegaLMM_state = clear_Posterior(MegaLMM_state)
+    # Draw n_iter new samples, storing the chain
+  MegaLMM_state = sample_MegaLMM(MegaLMM_state,n_iter)
+    # make diagnostic plots
+  traceplot_array(MegaLMM_state$Posterior$Lambda,name = file.path(MegaLMM_state$run_ID,'Lambda.pdf'))
+  traceplot_array(MegaLMM_state$Posterior$U,name =  file.path(MegaLMM_state$run_ID,'U.pdf'),
+                  facet_dim = 3)
+  print(sprintf('Completed %d burnin samples', MegaLMM_state$current_state$nrun))
+}
+MegaLMM_state = clear_Posterior(MegaLMM_state)
+# Have a look at `Lambda.pdf` and `U.pdf` to check convergence
+########### Collect posterior samples
+n_iter = 250
+for(i in 1:4) {
+  print(sprintf('Sampling run %d',i))
+  MegaLMM_state = sample_MegaLMM(MegaLMM_state,n_iter) 
+  MegaLMM_state = save_posterior_chunk(MegaLMM_state)
+  print(MegaLMM_state)
+}
+```
+Thinning rate is 2, running a total of 1000 sampling iterations, ending up with 500 posterior samples.
+
+## Post analysis
+Accessing posterior distributions
+```{r}
+Lambda_samples = load_posterior_param(MegaLMM_state,'Lambda')
+U_samples = load_posterior_param(MegaLMM_state,'U')
+dim(U_samples)
+U_hat = get_posterior_mean(U_samples) # `U_hat` is the predicted additive genetic value for every genotype for every trait.
+dim(U_hat)
+Eta_mean = load_posterior_param(MegaLMM_state,'Eta_mean') #  the predicted total genetic value
+print(MegaLMM_state)
+summary(MegaLMM_state)
+plot(U_samples[,1,2],type='l')
+#traceplot_array(MegaLMM_state$Posterior$U,facet_dim = 2,name = 'U')
+U_HPD = get_posterior_HPDinterval(U_samples,prob = 0.95)
+dim(U_HPD)
+G_samples = get_posterior_FUN(MegaLMM_state,
+              t(Lambda) %*% diag(F_h2[1,]) %*% Lambda + diag(resid_h2[,1]/tot_Eta_prec[1,])
+            )
+dim(G_samples)
+```
+## bWGR
+
+```{r}
+Amat.m <- as.matrix(Amat)
+Y.m <- as.matrix(Y)
+res.bwgr <- mkr(Y.m,Amat.m)
+res.bwgr$h2  # Heritabilies
+res.bwgr$GC  # Genetic correlation
+res.bWGR <- res.bwgr$hat %>%
+  as.data.frame() #%>% # fitted values
+colnames(res.bWGR) <- colnames(Y)
+  
+res.bWGR <- res.bWGR %>%
+  mutate(Individual = data.pc$Individual) %>%
+  mutate(Prod_bwgr = 0.5*(HT_6 + DBH_4)) %>% # Production index
+  mutate(Qual_bwgr = 0.5*Prod_bwgr + 0.25*StiffnessTree_5 + 0.25*Density_4) %>% # quality index
+  mutate(Disease_bwgr = 0.67*Prod_bwgr - 0.33*Rustbin_1) # disease resistance
+
+```
+## Calculate indicies for comparison with PCA
+
+```{r}
+
+############
+reorder_rank2 <- function(ind.rank){
+  # column 1 is the classic procedure
+  # column 2 is the PC approach 
+  # column 3 is the MegaLMM approach
+  nr <- nrow(ind.rank)
+  ind.rank.n <- matrix(0,nr,3)
+  for (i in 1:nr){
+    nr1 <- ind.rank[i,1] # reference
+    ind.rank.n[which(ind.rank[,2]==nr1),1]<- i
+    ind.rank.n[which(ind.rank[,3]==nr1),2]<- i
+    ind.rank.n[which(ind.rank[,4]==nr1),3]<- i
+  }
+  return(ind.rank.n)
+}
+
+# Step 1: calculate index 
+# for production (here volume): 50% height and 50% diameter
+res.mega <- U_hat %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "Individual") %>%
+  mutate(Individual = str_replace(Individual, "::Individual", "")) %>%
+  mutate(Prod_mega = 0.5*(HT_6 + DBH_4)) %>% # Production index
+  mutate(Qual_mega = 0.5*Prod_mega + 0.25*StiffnessTree_5 + 0.25*Density_4) %>% # quality index
+  mutate(Disease_mega = 0.67*Prod_mega - 0.33*Rustbin_1) # disease resistance
+
+df.ref <- df.ref %>%
+  arrange(Trait, Individual)
+
+
+
+# Step 3: compare indices
+comp <- merge(selindex,res.mega,by = "Individual")
+comp2 <- merge(comp, res.bWGR,by = "Individual")
+
+#### Production
+ind1 <- order(comp2$ProdIndex,decreasing = TRUE) # Traditional
+ind2 <- order(comp2$PCprod,decreasing = TRUE) # PCA, reverse order
+indm <- order(comp2$Prod_mega,decreasing = TRUE) # MegaLMM
+indb <- order(comp2$Prod_bwgr,decreasing = TRUE) # bWGR
+ind.rank.p <- data.frame(ClassicRankProduction = ind1,PCRankProduction = ind2,MegaLMMProd = indm,bWGRProd = indb)
+print(ind.rank.p[1:25,])
+
+#### Disease
+ind1 <- order(comp2$DiseaseIndex,decreasing = TRUE) # Traditional
+ind2 <- order(comp2$PCdisease,decreasing = TRUE) # PCA, reverse order
+indm <- order(comp2$Disease_mega,decreasing = TRUE) # MegaLMM
+indb <- order(comp2$Disease_bwgr,decreasing = TRUE) # bWGR
+ind.rank.d <- data.frame(ClassicRankDisease = ind1,PCRankDisease = ind2,MegaLMMDis = indm,bWGRDis = indb)
+print(ind.rank.d[1:25,])
+
+#### Quality
+ind1 <- order(comp2$QualIndex,decreasing = TRUE) # Traditional
+ind2 <- order(comp2$PCqual,decreasing = TRUE) # PCA, reverse order
+indm <- order(comp2$Qual_mega,decreasing = TRUE) # MegaLMM
+indb <- order(comp2$Qual_bwgr,decreasing = TRUE) # bWGR
+ind.rank.q <- data.frame(ClassicRankQual = ind1,PCRankQual = ind2,MegaLMMQual = indm,bWGRQual = indb)
+print(ind.rank.q[1:25,])
+
+rank1 <- reorder_rank2(ind.rank.d)
+rank2 <- reorder_rank2(ind.rank.p)
+rank3 <- reorder_rank2(ind.rank.q)
+ind.rank <- data.frame(Disease = rank1[,1],Production = rank2[,1],Quality = rank3[,1],DiseaseMegaLMM = rank1[,2],ProductionMegaLMM = rank2[,2],QualityMegaLMM = rank3[,2],DiseasebWGR = rank1[,3],ProductionbWGR = rank2[,3],QualitybWGR = rank3[,3],Reference = seq(1,length(rank1)))
+ind.rank.long <- melt(ind.rank,id.vars=c("Reference")) %>%
+  rename(Rank = value,SelectionIndex = variable)
+
+# Zoom in on top 50
+ind.rank.long.50 <- ind.rank.long %>%
+  filter(Reference <= 50)
+################ Kendalls tau for rank lists of reference and MegaLMM
+ind.rank.long.50.prod <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "ProductionMegaLMM")
+ind.rank.long.50.qual <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "QualityMegaLMM")
+ind.rank.long.50.dis <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "DiseaseMegaLMM")
+corr_prod <- cor.test(ind.rank.long.50.prod$Rank, ind.rank.long.50.prod$Reference, method = "kendall"); corr_prod
+corr_qual <- cor.test(ind.rank.long.50.qual$Rank, ind.rank.long.50.qual$Reference, method = "kendall"); corr_qual
+corr_dis <- cor.test(ind.rank.long.50.dis$Rank, ind.rank.long.50.dis$Reference, method = "kendall"); corr_dis
+
+################ Kendalls tau for rank lists of PCA and MegaLMM
+ind.rank.long.50.prod2 <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "Production")
+ind.rank.long.50.qual2 <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "Quality")
+ind.rank.long.50.dis2 <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "Disease")
+corr_prod2 <- cor.test(ind.rank.long.50.prod$Rank, ind.rank.long.50.prod2$Rank, method = "kendall"); corr_prod2
+corr_qual2 <- cor.test(ind.rank.long.50.qual$Rank, ind.rank.long.50.qual2$Rank, method = "kendall"); corr_qual2
+corr_dis2 <- cor.test(ind.rank.long.50.dis$Rank, ind.rank.long.50.dis2$Rank, method = "kendall"); corr_dis2
+
+############### Kendalls tau for rank lists of PCA and Reference
+
+ind.rank.long.50.prod <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "Production")
+ind.rank.long.50.qual <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "Quality")
+ind.rank.long.50.dis <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "Disease")
+corr_prod3 <- cor.test(ind.rank.long.50.prod$Rank, ind.rank.long.50.prod$Reference, method = "kendall"); corr_prod3
+corr_qual3 <- cor.test(ind.rank.long.50.qual$Rank, ind.rank.long.50.qual$Reference, method = "kendall"); corr_qual3
+corr_dis3 <- cor.test(ind.rank.long.50.dis$Rank, ind.rank.long.50.dis$Reference, method = "kendall"); corr_dis3
+################### bWGR
+################ Kendalls tau for rank lists of reference and bWGR
+ind.rank.long.50.prod <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "ProductionbWGR")
+ind.rank.long.50.qual <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "QualitybWGR")
+ind.rank.long.50.dis <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "DiseasebWGR")
+corr_prod4 <- cor.test(ind.rank.long.50.prod$Rank, ind.rank.long.50.prod$Reference, method = "kendall"); corr_prod4
+corr_qual4 <- cor.test(ind.rank.long.50.qual$Rank, ind.rank.long.50.qual$Reference, method = "kendall"); corr_qual4
+corr_dis4 <- cor.test(ind.rank.long.50.dis$Rank, ind.rank.long.50.dis$Reference, method = "kendall"); corr_dis4
+
+################ Kendalls tau for rank lists of PCA and bWGR
+ind.rank.long.50.prod2 <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "Production")
+ind.rank.long.50.qual2 <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "Quality")
+ind.rank.long.50.dis2 <- ind.rank.long.50 %>%
+  filter(SelectionIndex == "Disease")
+corr_prod5 <- cor.test(ind.rank.long.50.prod$Rank, ind.rank.long.50.prod2$Rank, method = "kendall"); corr_prod5
+corr_qual5 <- cor.test(ind.rank.long.50.qual$Rank, ind.rank.long.50.qual2$Rank, method = "kendall"); corr_qual5
+corr_dis5 <- cor.test(ind.rank.long.50.dis$Rank, ind.rank.long.50.dis2$Rank, method = "kendall"); corr_dis5
+
+
+######## make df
+r_est <- c(corr_qual$estimate,corr_qual2$estimate,corr_qual3$estimate,corr_qual4$estimate,corr_qual5$estimate,corr_prod$estimate,corr_prod2$estimate,corr_prod3$estimate,corr_prod4$estimate,corr_prod5$estimate,corr_dis$estimate,corr_dis2$estimate,corr_dis3$estimate,corr_dis4$estimate,corr_dis5$estimate)
+p_val <- c(corr_qual$p.value,corr_qual2$p.value,corr_qual3$p.value,corr_qual4$p.value,corr_qual5$p.value,corr_prod$p.value,corr_prod2$p.value,corr_prod3$p.value,corr_prod4$p.value,corr_prod5$p.value,corr_dis$p.value,corr_dis2$p.value,corr_dis3$p.value,corr_dis4$p.value,corr_dis5$p.value)
+index_t <- c(rep("Quality",5),rep("Production",5),rep("DiseaseResistance",5))
+Method <- rep("Kendall",length(r_est))
+Comparison <- rep(c("MegaLMM-Reference","PCA-MegaLMM","PCA-Reference","bWGR-Reference","PCA-bWGR"),3)
+Data <- rep("Loblolly pine",length(r_est))
+df_cor1 <- data.frame(Estimate = r_est,Pval = p_val, Index = index_t, Method = Method, Comparison = Comparison, Data = Data)
+
+##################### Pearson correlation of EBVs between MegaLMM and reference method
+
+res_q = cor.test(comp2$QualIndex,comp2$Qual_mega); res_q
+res_p = cor.test(comp2$ProdIndex,comp2$Prod_mega); res_p
+res_d = cor.test(comp2$DiseaseIndex,comp2$Disease_mega); res_d
+
+##################### Pearson correlation of EBVs between MegaLMM and PCA approach
+
+res_q2 = cor.test(comp2$PCqual,comp2$Qual_mega); res_q2
+res_p2 = cor.test(comp2$PCprod,comp2$Prod_mega); res_p2
+res_d2 = cor.test(comp2$PCdisease,comp2$Disease_mega); res_d2
+
+##################### PCA and reference
+
+res_q3 = cor.test(comp2$PCqual,comp2$QualIndex); res_q3
+res_p3 = cor.test(comp2$PCprod,comp2$ProdIndex); res_p3
+res_d3 = cor.test(comp2$PCdisease,comp2$DiseaseIndex); res_d3
+
+##################### Pearson correlation of EBVs between bWGR and reference method
+
+res_q4 = cor.test(comp2$QualIndex,comp2$Qual_bwgr); res_q4
+res_p4 = cor.test(comp2$ProdIndex,comp2$Prod_bwgr); res_p4
+res_d4 = cor.test(comp2$DiseaseIndex,comp2$Disease_bwgr); res_d4
+
+##################### Pearson correlation of EBVs between bWGR and PCA approach
+
+res_q5 = cor.test(comp2$PCqual,comp2$Qual_bwgr); res_q5
+res_p5 = cor.test(comp2$PCprod,comp2$Prod_bwgr); res_p5
+res_d5 = cor.test(comp2$PCdisease,comp2$Disease_bwgr); res_d5
+############# make df
+r_est <- c(res_q$estimate,res_q2$estimate,res_q3$estimate,res_q4$estimate,res_q5$estimate,res_p$estimate,res_p2$estimate,res_p3$estimate,res_p4$estimate,res_p5$estimate,res_d$estimate,res_d2$estimate,res_d3$estimate,res_d4$estimate,res_d5$estimate)
+p_val <- c(res_q$p.value,res_q2$p.value,res_q3$p.value,res_q4$p.value,res_q5$p.value,res_p$p.value,res_p2$p.value,res_p3$p.value,res_p4$p.value,res_p5$p.value,res_d$p.value,res_d2$p.value,res_d3$p.value,res_d4$p.value,res_d5$p.value)
+index_t <- c(rep("Quality",5),rep("Production",5),rep("DiseaseResistance",5))
+Method <- rep("Pearson",length(r_est))
+Comparison <- rep(c("MegaLMM-Reference","PCA-MegaLMM","PCA-Reference","bWGR-Reference","PCA-bWGR"),3)
+Data <- rep("Loblolly pine",length(r_est))
+df_cor2 <- data.frame(Estimate = r_est,Pval = p_val,Index = index_t, Method = Method, Comparison = Comparison, Data = Data)
+df_cor <- rbind(df_cor1,df_cor2)
+df_cort <- df_cor %>%
+  filter(!grepl('bWGR',Comparison))
+write.table(x = df_cor,file = "Correlation_table.txt",quote = FALSE, sep = ",",row.names = FALSE)
+```
+
+
+## Plot MegaLMM, PCA correlations
+
+```{r}
+df_cor$Significance <- ifelse(df_cor$Pval < 0.01, "**", ifelse(df_cor$Pval < 0.05, "*", ""))
+
+cor_p <- ggplot(df_cor, aes(x = Index, y = Estimate, fill = Comparison)) +
+  geom_bar(stat = "identity", position=position_dodge(), color="black") +
+  facet_wrap(~ Method, scales = "free") +
+  scale_fill_manual(values=c("#999999", "#E69F00", "#56B4E9")) +
+  geom_text(aes(label = Significance), position = position_dodge(width = 0.8), vjust = -0.1, color = "black") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Loblolly pine",
+       x = "Trait type",
+       y = "Estimate"); cor_p
+ggsave(filename = "barplot_correlations.png",plot = cor_p,dpi = 300)
+ggsave(filename = "barplot_correlations.pdf",plot = cor_p,dpi = 300)
+
+
+######################################
+# Venn diagram
+########### quality
+data_list <- list(Ref = ind.rank.q[1:50,"ClassicRankQual"], PCA = ind.rank.q[1:50,"PCRankQual"],MegaLMM = ind.rank.q[1:50,"MegaLMMQual"])
+
+pvq <- ggVennDiagram(data_list, label = "count",label_txtWidth = 10) +
+  scale_fill_gradient(low = "white", high = "#4981BF") +
+  theme_void() +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 8),
+        plot.subtitle = element_text(size = 8),  # Adjust the size as needed
+    plot.caption = element_text(size = 6)) +
+  labs(x = "",
+       y = ""); pvq
+############ Production
+data_list <- list(Ref = ind.rank.p[1:50,"ClassicRankProduction"], PCA = ind.rank.p[1:50,"PCRankProduction"],MegaLMM = ind.rank.p[1:50,"MegaLMMProd"])
+pvp <- ggVennDiagram(data_list, label = "count",label_txtWidth = 10) +
+  scale_fill_gradient(low = "white", high = "brown") +
+  theme_void() +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 8),
+        plot.subtitle = element_text(size = 8),  # Adjust the size as needed
+    plot.caption = element_text(size = 6)) +
+  labs(x = "",
+       y = ""); pvp
+############ Disease resistance
+data_list <- list(Ref = ind.rank.d[1:50,"ClassicRankDisease"], PCA = ind.rank.d[1:50,"PCRankDisease"],MegaLMM = ind.rank.d[1:50,"MegaLMMDis"])
+pvd <- ggVennDiagram(data_list, label = "count",label_txtWidth = 10) +
+  scale_fill_gradient(low = "white", high = "darkgreen") +
+  theme_void() +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 8),
+        plot.subtitle = element_text(size = 8),  # Adjust the size as needed
+    plot.caption = element_text(size = 6)) +
+  labs(x = "",
+       y = ""); pvd
+
+```
+
+## rrBLUP
+
+```{r}
+mixed_model <- function(y, K) {
+  ans <- mixed.solve(y, K = K, method = "REML", bounds = c(1e-09, 1e+09))
+  h2 <- ans$Vu / (ans$Vu + ans$Ve)
+  return(c(Vu = ans$Vu, Ve = ans$Ve, h2 = h2))
+}
+set.seed(123)  # For reproducibility
+n_subsamples <- 10  # Number of subsamples
+subsample_fraction <- 0.8  # Fraction of data to subsample
+n <- length(y)
+subsample_size <- floor(subsample_fraction * n)
+
+############# PC1
+y <- data.pc$PC1
+ans <- mixed.solve(y,K=Amat, method="REML", bounds=c(1e-09, 1e+09),SE = FALSE)
+# y is vector of y observations, K is kinship or relatedness matrix
+# the defualt method is REML, the bounds specifies the upper and lower bound for 
+# ridge parameter 
+#### h2
+h21 = ans$Vu/(ans$Vu + ans$Ve); h21
+subsample_results <- replicate(n_subsamples, {
+  sample_indices <- sample(1:n, subsample_size, replace = FALSE)
+  y_subsample <- y[sample_indices]
+  Amat_s <- Amat[sample_indices,sample_indices]
+  mixed_model(y_subsample, K = Amat_s)
+})
+
+# Calculate standard deviations
+subsample_results <- t(subsample_results)
+se_Vu <- sd(subsample_results[, "Vu"])
+se_Ve <- sd(subsample_results[, "Ve"])
+se_h2 <- sd(subsample_results[, "h2"]); se_h2
+############# PC2
+y <- data.pc$PC2
+ans <- mixed.solve(y,K=Amat, method="REML", bounds=c(1e-09, 1e+09),SE = FALSE)
+# y is vector of y observations, K is kinship or relatedness matrix
+# the defualt method is REML, the bounds specifies the upper and lower bound for 
+# ridge parameter 
+#### h2
+h22 = ans$Vu/(ans$Vu + ans$Ve); h22
+subsample_results <- replicate(n_subsamples, {
+  sample_indices <- sample(1:n, subsample_size, replace = FALSE)
+  y_subsample <- y[sample_indices]
+  Amat_s <- Amat[sample_indices,sample_indices]
+  mixed_model(y_subsample, K = Amat_s)
+})
+
+# Calculate standard deviations
+subsample_results <- t(subsample_results)
+se_Vu <- sd(subsample_results[, "Vu"])
+se_Ve <- sd(subsample_results[, "Ve"])
+se_h2 <- sd(subsample_results[, "h2"]); se_h2
+############# PC3
+y <- data.pc$PC3
+ans <- mixed.solve(y,K=Amat, method="REML", bounds=c(1e-09, 1e+09),SE = FALSE)
+# y is vector of y observations, K is kinship or relatedness matrix
+# the defualt method is REML, the bounds specifies the upper and lower bound for 
+# ridge parameter 
+#### h2
+h23 = ans$Vu/(ans$Vu + ans$Ve); h23
+######## std deviations
+
+subsample_results <- replicate(n_subsamples, {
+  sample_indices <- sample(1:n, subsample_size, replace = FALSE)
+  y_subsample <- y[sample_indices]
+  Amat_s <- Amat[sample_indices,sample_indices]
+  mixed_model(y_subsample, K = Amat_s)
+})
+
+# Calculate standard deviations
+subsample_results <- t(subsample_results)
+se_Vu <- sd(subsample_results[, "Vu"])
+se_Ve <- sd(subsample_results[, "Ve"])
+se_h2 <- sd(subsample_results[, "h2"]); se_h2
+
+############### computational time ###############
+T <- matrix(0,10,1)
+y <- data.pc1$PC3
+for(i in 1:10){
+  start_time <- Sys.time()
+  ans <- mixed.solve(y,K=Amat, method="REML", bounds=c(1e-09, 1e+09),SE = FALSE)
+  end_time <- Sys.time()
+  time_taken <- round(end_time - start_time, 2)
+  T[i] <- time_taken
+  print(paste("Execution time:", time_taken, "seconds"))
+  
+}
+cat(sprintf('Average time: %f (%f)\n',mean(T),sd(T)))
+```
+
+
+## Figures
+
+```{r}
+
+fig6 <- plot_grid(
+  p2, p3, 
+  labels = c("a","b"),
+  ncol = 1  # Number of columns in the grid 
+); fig6
+fig7 <- plot_grid(
+  ppc, pvq, pvp, pvd, 
+  labels = c("a","b","c","d"),
+  ncol = 2  # Number of columns in the grid 
+); fig7
+fig7old <- plot_grid(
+  ppc, fpz,   
+  labels = c("a","b"),
+  ncol = 2  # Number of columns in the grid 
+); fig7old
+ggsave(filename = "figure6.pdf",plot = fig6,dpi = 300,height = 12,width = 12)
+ggsave(filename = "figure6.png",plot = fig6,dpi = 300,height = 12,width = 12)
+ggsave(filename = "figure7.pdf",plot = fig7,dpi = 300,height = 12,width = 12)
+ggsave(filename = "figure7.png",plot = fig7,dpi = 300,height = 12,width = 12)
+```
+
