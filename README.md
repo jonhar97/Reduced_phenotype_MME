@@ -160,6 +160,9 @@ mu <- colMeans(dataF264_v2[,c("Adj_Dia_14","Adj_Dia_26","Adj_Dia_47","Adj_Fstam_
 EBV.pc <- as.data.frame(G_pc %*% t(rotation) + mu)
 
 ```
+
+Interested readers are invited to see [[4]](#4) for further information.
+
 # References
 <a id="1">[1]</a> Dutkowski, G. W., Costa E Silva, J., Gilmour, A. R., Wellendorf, H., & Aguiar, A. (2006). Spatial analysis enhances modelling of a wide variety of traits in forest genetic trials. Canadian Journal of Forest Research, 36(7), 1851–1870. 
 
