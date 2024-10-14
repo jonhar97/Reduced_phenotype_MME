@@ -1,0 +1,177 @@
+---
+title: "Example"
+author: "Jon Ahlinder"
+date: "2024-10-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(dplyr)
+require(ggplot2)
+library(forcats)
+library(brms) # for analysis of PCs
+library(nadiv) # for NRM calculation
+```
+
+# Example analysis of a Scots pine field trial
+
+
+## Read data
+
+```{r}
+######### adjusted phenotypic records
+dataF264_v2 <- 
+  read.table(file = "../data/data_F264.txt",sep=",",header = T)
+######### pedigree
+pedigreeF264 <- read.table(file = "../data/pedigree_F264.txt",sep=",",header=T)
+```
+
+## Select a subset of data for example analysis
+Note that you can impute missing data instead of just removing genotypes. The data is normalized as well.
+```{r}
+dataF264_v2 <- dataF264_v2 %>%
+  na.omit() %>%
+  mutate_each_(list(~scale(.) %>% as.vector),
+                                  vars = 3:ncol(dataF264_v2))
+```
+## PCA
+
+```{r}
+results <- prcomp(dataF264_v2[,3:ncol(dataF264_v2)])
+results$Genotype_id <- dataF264_v2$Genotype_id
+# Access the proportion of variance explained by each PC
+var_explained <- results$sdev^2 / sum(results$sdev^2)
+# Create a data frame for plotting
+plot_data <- data.frame(
+  PC = as.factor(paste0("PC",1:length(var_explained))),
+  VarianceExplained = var_explained*100
+)
+# Reorder the factor levels of PC based on VarianceExplained
+plot_data <- plot_data %>%
+  mutate(PC = fct_reorder(PC, VarianceExplained, .desc = TRUE))
+
+# Create a bar plot using ggplot2
+ggplot(plot_data, aes(x = PC, y = VarianceExplained)) +
+  geom_bar(stat = "identity", fill = "steelblue",color = "black") +
+  labs(
+    x = "",
+    y = "Variance explained (%)",
+    title = ""
+  ) +
+  theme_minimal() + 
+  theme(axis.text = element_text(size=11, color = "black"), axis.title = element_text(size = 11),
+        axis.text.x = element_text(angle = 45))
+# loading plot
+# PC1 vs PC2
+PC <- as.data.frame(results$rotation)
+# fix labels
+x_label <- sprintf("PC1 (%.1f%%)", plot_data$VarianceExplained[1])
+y_label <- sprintf("PC2 (%.1f%%)", plot_data$VarianceExplained[2])
+ggplot(PC, aes(x = PC1, y = PC2)) +
+  geom_point(size=2) +
+   theme(axis.text = element_text(size = 11,color = "black"),legend.text = element_text(size = 11)) +
+  theme_minimal() +
+  geom_text(
+    label = rownames(PC),
+    nudge_x=0.03, nudge_y=0.03,
+    check_overlap=T,
+color = "black",
+  size = 3)  +
+  labs(color='Trait category') +
+  xlab(x_label) +
+  ylab(y_label)
+```
+
+## Calculate numerator relationship matrix
+
+```{r}
+dataF264_v2 <- merge(dataF264_v2,pedigreeF264,by = "Genotype_id")
+ord <- as.data.frame(results$x) %>%
+  mutate(Genotype_id = results$Genotype_id)
+dataF264_v2 <- merge(dataF264_v2,ord,by = "Genotype_id")
+```
+
+## Analyse PC components using Rstan via BMRS package
+We use bmrs which runs Bayesian Multilevel Models using Stan. NB I only use the first three principal components here, but for optimal performance, all should be analysed. 
+```{r}
+ped_tmp <- data.frame(Genotype_id = dataF264_v2$Genotype_id, sire = dataF264_v2$Dad_id, dam = dataF264_v2$Mum_id) %>% 
+  prepPed()
+Amat <- as.matrix(makeA(ped_tmp)) # Create A matrix
+
+bf_PC1 <- bf(PC1 ~ 1 + (1 | a | gr(Genotype_id, cov = Amat)))
+bf_PC2 <- bf(PC2 ~ 1 + (1 | a | gr(Genotype_id, cov = Amat)))
+bf_PC3 <- bf(PC3 ~ 1 + (1 | a | gr(Genotype_id, cov = Amat)))
+
+############## PC1
+brms_m1.pc1 <- brm(
+  bf_PC1, 
+  data = dataF264_v2,
+  data2 = list(Amat = Amat),
+  family = gaussian(),
+  chains = 6, 
+  cores = 6
+)
+plot(brms_m1.pc1)
+summary(brms_m1.pc1)
+mcmc_plot(brms_m1.pc1, type = "acf")
+############## PC2
+brms_m1.pc2 <- brm(
+  bf_PC2, 
+  data = dataF264_v2,
+  data2 = list(Amat = Amat),
+  family = gaussian(),
+  chains = 6, 
+  cores = 6
+)
+plot(brms_m1.pc2)
+summary(brms_m1.pc2)
+mcmc_plot(brms_m1.pc2, type = "acf")
+############## PC3
+brms_m1.pc3 <- brm(
+  bf_PC3, 
+  data = dataF264_v2,
+  data2 = list(Amat = Amat),
+  family = gaussian(),
+  chains = 6, 
+  cores = 6
+)
+plot(brms_m1.pc3)
+summary(brms_m1.pc3)
+mcmc_plot(brms_m1.pc3, type = "acf")
+
+###################### heritability ###############################
+v_individual <- (VarCorr(brms_m1.pc1, summary = FALSE)$Genotype_id$sd)^2
+v_r <- (VarCorr(brms_m1.pc1, summary = FALSE)$residual$sd)^2
+h.pc1 <- as.mcmc(v_individual / (v_individual + v_r))
+summary(h.pc1)
+v_individual <- (VarCorr(brms_m1.pc2, summary = FALSE)$Genotype_id$sd)^2
+v_r <- (VarCorr(brms_m1.pc2, summary = FALSE)$residual$sd)^2
+h.pc2 <- as.mcmc(v_individual / (v_individual + v_r))
+summary(h.pc2)
+v_individual <- (VarCorr(brms_m1.pc3, summary = FALSE)$Genotype_id$sd)^2
+v_r <- (VarCorr(brms_m1.pc3, summary = FALSE)$residual$sd)^2
+h.pc3 <- as.mcmc(v_individual / (v_individual + v_r))
+summary(h.pc3)
+
+plot(h.pc1)
+plot(h.pc2)
+plot(h.pc3)
+
+```
+
+
+## Obtain EBV on original phenotypic scale
+```{r}
+############################## Backtransform
+### df with EBVs for each tree
+G_ebv
+data.pc.b <- G_ebv %>%
+  select(c(PC1,PC2,PC3)) %>%
+  as.matrix()
+rotation <- as.matrix(results$rotation)
+mu <- colMeans(dataF264_norm[,3:17])
+EBV.pc <- as.data.frame(data.pc.b %*% t(rotation) + mu)
+EBV.pc$Genotype_id <- selindex$Individual
+
+```
