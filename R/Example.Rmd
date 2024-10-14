@@ -165,13 +165,15 @@ plot(h.pc3)
 ```{r}
 ############################## Backtransform
 ### df with EBVs for each tree
-G_ebv
-data.pc.b <- G_ebv %>%
-  select(c(PC1,PC2,PC3)) %>%
+posterior_samples1 <- posterior_samples(brms_m1.pc1)
+posterior_samples2 <- posterior_samples(brms_m1.pc2)
+posterior_samples3 <- posterior_samples(brms_m1.pc3)
+# Calculate the posterior mean for the Genotype_id effect
+G_pc <- data.frame(PC1 = colMeans(posterior_samples1[, grep("^r_Genotype_id\\[", colnames(posterior_samples1))]), PC2 = colMeans(posterior_samples2[, grep("^r_Genotype_id\\[", colnames(posterior_samples2))]), PC3 = colMeans(posterior_samples3[, grep("^r_Genotype_id\\[", colnames(posterior_samples3))])) %>%
   as.matrix()
-rotation <- as.matrix(results$rotation)
-mu <- colMeans(dataF264_norm[,3:17])
-EBV.pc <- as.data.frame(data.pc.b %*% t(rotation) + mu)
-EBV.pc$Genotype_id <- selindex$Individual
+
+rotation <- as.matrix(results$rotation[,1:3])
+mu <- colMeans(dataF264_v2[,c("Adj_Dia_14","Adj_Dia_26","Adj_Dia_47","Adj_Fstam_47","Adj_Ftopp_47","Adj_Gant_14","Adj_Gdia_26","Adj_Gdiagr130_14","Adj_Gvin_26","Adj_Gvingr130_14","Adj_Hjd_10",     "Adj_Hjd_14","Adj_Hjd_26","Adj_Hjd_47","Adj_Kvar_47","Adj_Lev_10","Adj_Lev_14","Adj_Lev_26","Adj_Lev_47","Adj_Rak_14","Adj_Sdbst_14","Adj_Sprant_14","Adj_Sprant_26","Adj_Vit_10","Adj_Vit_14","Adj_Vit_26","Adj_Vit_47")])
+EBV.pc <- as.data.frame(G_pc %*% t(rotation) + mu)
 
 ```
