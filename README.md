@@ -8,7 +8,7 @@ The Scots pine example data and pedigree are provided in the directory data. The
 The Loblolly pine data example was provided as a part of the genomic selection benchmark data collection in Genetics by Resende et al. [[2]](#2). The issue can be found [here](https://academic.oup.com/genetics/article/190/4/1503/6064084).
 
 # Example
-Analysing the Scots pine data. All traits are used here and any individual with missing data is removed for simplicity.
+Analysing the Scots pine data. All traits are used here and any individual with missing data is removed for simplicity. Note that different softwares can be used (here R).
 ```R
 require(dplyr)
 require(ggplot2)
@@ -73,6 +73,9 @@ color = "black",
   xlab(x_label) +
   ylab(y_label)
 ```
+![Histogram of variance explained](https://github.com/jonhar97/Reduced_phenotype_MME/blob/main/R/histogram_example.png)
+
+
 # References
 <a id="1">[1]</a> Dutkowski, G. W., Costa E Silva, J., Gilmour, A. R., Wellendorf, H., & Aguiar, A. (2006). Spatial analysis enhances modelling of a wide variety of traits in forest genetic trials. Canadian Journal of Forest Research, 36(7), 1851–1870. 
 
